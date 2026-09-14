@@ -230,9 +230,19 @@ pub struct CreateMintWithFee<'info> {
  
 #[derive(Accounts)]
 pub struct AssertSupportedMint<'info> {
-     /// CHECK: The account is parsed as a Token-2022 Mint and its extensions
-    /// are explicitly validated against SUPPORTED_EXTENSIONS.
+    /// Unchecked so the account is parsed exactly once, in the handler.
+    ///
+    /// The `owner` constraint is not optional. `StateWithExtensions::unpack`
+    /// receives a byte slice and validates only the layout, so without this
+    /// any account from any program whose bytes look like an initialized mint
+    /// would be accepted.
+    ///
+    /// CHECK: ownership enforced below, contents allowlisted in the handler.
+    #[account(owner = token_program.key())]
     pub mint: UncheckedAccount<'info>,
+
+    /// Constrains `owner` above to SPL Token or Token-2022, and nothing else.
+    pub token_program: Interface<'info, TokenInterface>,
 }
 
 #[error_code]
