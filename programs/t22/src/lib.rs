@@ -137,6 +137,49 @@ pub mod t22 {
         );
         Ok(())
     }
+
+
+      pub fn assert_supported_mint(ctx: Context<AssertSupportedMint>) -> Result<()> {
+      
+        
+ 
+        // Not available from the typed account. Drop to the raw bytes.
+        let account_info = ctx.accounts.mint.to_account_info();
+        let data = account_info.try_borrow_data()?;
+        let state = StateWithExtensions::<MintState>::unpack(&data)?;
+          
+          // Available from the typed account, no extension awareness needed.
+        let decimals = state.base.decimals;
+ 
+        for extension in state.get_extension_types()? {
+            require!(
+                SUPPORTED_EXTENSIONS.contains(&extension),
+                MintError::UnsupportedExtension
+            );
+        }
+ 
+        // A transfer fee means the amount credited is not the amount debited.
+        // Any accounting that assumes otherwise is wrong against this mint, so
+        // read the live fee rather than assuming zero.
+        //
+        // Fees are epoch scheduled: `newer_transfer_fee` may not be in force
+        // yet, which is why `get_epoch_fee` takes the current epoch.
+        let basis_points = match state.get_extension::<TransferFeeConfig>() {
+            Ok(config) => u16::from(
+                config
+                    .get_epoch_fee(Clock::get()?.epoch)
+                    .transfer_fee_basis_points,
+            ),
+            Err(_) => 0,
+        };
+ 
+        msg!(
+            "mint accepted: {} decimals, {} bps fee",
+            decimals,
+            basis_points
+        );
+        Ok(())
+    }
  
   
 }
@@ -187,7 +230,9 @@ pub struct CreateMintWithFee<'info> {
  
 #[derive(Accounts)]
 pub struct AssertSupportedMint<'info> {
-    pub mint: InterfaceAccount<'info, Mint>,
+     /// CHECK: The account is parsed as a Token-2022 Mint and its extensions
+    /// are explicitly validated against SUPPORTED_EXTENSIONS.
+    pub mint: UncheckedAccount<'info>,
 }
 
 #[error_code]
