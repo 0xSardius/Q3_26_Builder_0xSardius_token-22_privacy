@@ -1,18 +1,22 @@
 
 use anchor_lang::prelude::*;
+use anchor_lang::solana_program::program::invoke;
 use anchor_spl::token_interface::{
     initialize_mint2, mint_close_authority_initialize, spl_token_2022, transfer_fee_initialize,
     InitializeMint2, Mint, MintCloseAuthorityInitialize, TokenInterface, TransferFeeInitialize,
 };
 use spl_token_2022::{
     extension::{
+        confidential_transfer::{instruction as confidential_instruction, DecryptableBalance},
         transfer_fee::TransferFeeConfig, BaseStateWithExtensions, ExtensionType,
         StateWithExtensions,
     },
     state::Mint as MintState,
 };
- 
 
+// The length of a ciphertext which is how a decryptable balance is represented in the account data
+pub const AE_CIPHERTEXT_LEN: usize = 36;
+ 
 declare_id!("6sC5C8VFoTpEZQVn3YK9EUSd5g3Cs6zTT3HCDBGQkyo4");
 
 
@@ -138,8 +142,152 @@ pub mod t22 {
         Ok(())
     }
 
+     /// `InterfaceAccount<'info, Mint>` looks like it gives you the whole mint.
+    /// It does not. Anchor's deserializer runs
+    /// `StateWithExtensions::unpack(buf).map(|t| Mint(t.base))`, which parses
+    /// the TLV region and then discards it, keeping only the base struct.
+    ///
+    /// So the typed account has decimals, supply and authorities, and knows
+    /// nothing about extensions. To see them you re-borrow the raw bytes and
+    /// run `StateWithExtensions` yourself. That is the same call the plain
+    /// Rust client makes.
+    /// 
+    /// Confidential TF: creating the mint.
+    ///
+    /// ConfidentialTransferMint is not one of Anchor's seven `extensions::`
+    /// constraints, and anchor-spl ships no CPI helper for it either. So this
+    /// builds the raw instruction and invokes it directly. Same three phases.
+    pub fn create_confidential_mint(
+        ctx: Context<CreateConfidentialMint>,
+        decimals: u8,
+        auto_approve_new_accounts: bool,
+    ) -> Result<()> {
+        let space = ExtensionType::try_calculate_account_len::<MintState>(&[
+            ExtensionType::ConfidentialTransferMint,
+        ])?;
+        let lamports = Rent::get()?.minimum_balance(space);
+ 
+        anchor_lang::system_program::create_account(
+            CpiContext::new(
+                ctx.accounts.system_program.key(),
+                anchor_lang::system_program::CreateAccount {
+                    from: ctx.accounts.payer.to_account_info(),
+                    to: ctx.accounts.mint.to_account_info(),
+                },
+            ),
+            lamports,
+            space as u64,
+            &ctx.accounts.token_program.key(),
+        )?;
+ 
+        // No auditor key here. Passing Some(pubkey) would let its holder
+        // decrypt every transfer amount for this mint, which is the usual
+        // compliance escape hatch.
+        let ix = confidential_instruction::initialize_mint(
+            &ctx.accounts.token_program.key(),
+            &ctx.accounts.mint.key(),
+            Some(ctx.accounts.payer.key()),
+            auto_approve_new_accounts,
+            None,
+        )?;
+        invoke(
+            &ix,
+            &[
+                ctx.accounts.mint.to_account_info(),
+                ctx.accounts.token_program.to_account_info(),
+            ],
+        )?;
+ 
+        initialize_mint2(
+            CpiContext::new(
+                ctx.accounts.token_program.key(),
+                InitializeMint2 {
+                    mint: ctx.accounts.mint.to_account_info(),
+                },
+            ),
+            decimals,
+            &ctx.accounts.payer.key(),
+            None,
+        )?;
+ 
+        msg!(
+            "confidential mint {} at {} bytes",
+            ctx.accounts.mint.key(),
+            space
+        );
+        Ok(())
+    }
 
-      pub fn assert_supported_mint(ctx: Context<AssertSupportedMint>) -> Result<()> {
+
+     /// Confidential: deposit.
+    ///
+    /// The only step of the confidential lifecycle a program can drive on its
+    /// own. Moving tokens from the public balance into the pending
+    /// confidential balance needs no zero knowledge proof, because the amount
+    /// was already public before the move.
+    pub fn deposit_confidential(
+        ctx: Context<DepositConfidential>,
+        amount: u64,
+        decimals: u8,
+    ) -> Result<()> {
+        let ix = confidential_instruction::deposit(
+            &ctx.accounts.token_program.key(),
+            &ctx.accounts.token_account.key(),
+            &ctx.accounts.mint.key(),
+            amount,
+            decimals,
+            &ctx.accounts.authority.key(),
+            &[],
+        )?;
+        invoke(
+            &ix,
+            &[
+                ctx.accounts.token_account.to_account_info(),
+                ctx.accounts.mint.to_account_info(),
+                ctx.accounts.authority.to_account_info(),
+                ctx.accounts.token_program.to_account_info(),
+            ],
+        )?;
+        Ok(())
+    }
+ 
+    
+    /// Confidential: apply pending balance.
+    ///
+    /// Incoming deposits and transfers land in a pending balance that cannot
+    /// be spent. Moving it to available requires the owner to supply the new
+    /// available balance already encrypted under their AES key.
+    ///
+    /// Note what that means: the program cannot compute this value. It has no
+    /// access to the owner's key. The ciphertext is an instruction argument,
+    /// and the program is a pass through. That limitation is the lesson.
+    pub fn apply_pending_balance(
+        ctx: Context<ApplyPendingBalance>,
+        expected_pending_balance_credit_counter: u64,
+        new_decryptable_available_balance: [u8; AE_CIPHERTEXT_LEN],
+    ) -> Result<()> {
+        let balance = DecryptableBalance::from(new_decryptable_available_balance);
+        let ix = confidential_instruction::apply_pending_balance(
+            &ctx.accounts.token_program.key(),
+            &ctx.accounts.token_account.key(),
+            expected_pending_balance_credit_counter,
+            &balance,
+            &ctx.accounts.authority.key(),
+            &[],
+        )?;
+        invoke(
+            &ix,
+            &[
+                ctx.accounts.token_account.to_account_info(),
+                ctx.accounts.authority.to_account_info(),
+                ctx.accounts.token_program.to_account_info(),
+            ],
+        )?;
+        Ok(())
+    }
+ 
+
+    pub fn assert_supported_mint(ctx: Context<AssertSupportedMint>) -> Result<()> {
       
         
  
@@ -242,6 +390,45 @@ pub struct AssertSupportedMint<'info> {
     pub mint: UncheckedAccount<'info>,
 
     /// Constrains `owner` above to SPL Token or Token-2022, and nothing else.
+    pub token_program: Interface<'info, TokenInterface>,
+}
+
+#[derive(Accounts)]
+pub struct CreateConfidentialMint<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+ 
+    /// CHECK: created and initialized in the handler, signs because the
+    /// account is made at its own address.
+    #[account(mut, signer)]
+    pub mint: UncheckedAccount<'info>,
+ 
+    pub token_program: Interface<'info, TokenInterface>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct DepositConfidential<'info> {
+    /// CHECK: validated by Token-2022, which rejects any account that is not
+    /// a token account for this mint configured for confidential transfers.
+    #[account(mut, owner = token_program.key())]
+    pub token_account: UncheckedAccount<'info>,
+ 
+    /// CHECK: validated by Token-2022 during the deposit.
+    #[account(owner = token_program.key())]
+    pub mint: UncheckedAccount<'info>,
+ 
+    pub authority: Signer<'info>,
+    pub token_program: Interface<'info, TokenInterface>,
+}
+ 
+#[derive(Accounts)]
+pub struct ApplyPendingBalance<'info> {
+    /// CHECK: validated by Token-2022.
+    #[account(mut, owner = token_program.key())]
+    pub token_account: UncheckedAccount<'info>,
+ 
+    pub authority: Signer<'info>,
     pub token_program: Interface<'info, TokenInterface>,
 }
 
