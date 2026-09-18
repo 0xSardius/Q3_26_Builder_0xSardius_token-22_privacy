@@ -17,10 +17,11 @@ use t22::{accounts, instruction, ID};
 use t22new::{
     extension::{
         confidential_transfer::{instruction as ct_ix, ConfidentialTransferAccount},
+        confidential_transfer_fee::{instruction::{disable_harvest_to_mint, enable_harvest_to_mint},ConfidentialTransferFeeAmount, ConfidentialTransferFeeConfig},
         BaseStateWithExtensions, ExtensionType, StateWithExtensions,
     },
     instruction::{initialize_account3, mint_to},
-    state::Account as TokenAccountState,
+    state::{Account as TokenAccountState, Mint as MintState}
 };
 use zk::{
     encryption::{
@@ -566,4 +567,269 @@ fn full_confidential_lifecycle() {
         "bob confidential available = {}",
         transfer_amount - withdraw_amount
     );
+}
+
+
+// this test proves the program doesn't just accept anything ( Flips a single bit inside the proof of an otherwise valid
+/// PubkeyValidity proof and confirms the ZK ElGamal Proof program rejects it.).
+#[test]
+fn a_tampered_proof_is_rejected() {
+    let (mut svm, payer) = setup();
+    let (elgamal, _aes) = derive_confidential_keys(&payer, b"").unwrap();
+ 
+    let good = build_pubkey_validity_proof_data(&elgamal).unwrap();
+    let mut tampered = good;
+ 
+    // The struct is Pod, so it can be viewed as raw bytes. The context sits
+    // first and the proof after it; flipping a bit in the tail corrupts the
+    // proof while leaving the claimed public key intact.
+    let bytes = bytemuck::bytes_of_mut(&mut tampered);
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0x01;
+ 
+    let ok_ix = ProofInstruction::VerifyPubkeyValidity.encode_verify_proof(None, &good);
+    let bad_ix = ProofInstruction::VerifyPubkeyValidity.encode_verify_proof(None, &tampered);
+ 
+    // The untouched proof verifies.
+    send(&mut svm, &payer, &[ok_ix], &[]);
+ 
+    // One flipped bit does not.
+    let bh = svm.latest_blockhash();
+    let mut tx = Transaction::new_unsigned(Message::new(&[bad_ix], Some(&payer.pubkey())));
+    tx.try_sign(&[&payer], bh).unwrap();
+    match svm.send_transaction(tx) {
+        Ok(_) => panic!("a tampered proof was accepted"),
+        Err(e) => {
+            let logs = e.meta.logs.join("\n");
+            println!("tampered proof rejected:\n{logs}");
+            assert!(logs.contains("proof verification failed"));
+        }
+    }
+}
+ 
+#[test]
+fn confidential_transfer_fee_mint_stacks_three_extensions() {
+    let (mut svm, payer) = setup();
+    let mint = Keypair::new();
+ 
+    // The fee is withheld as an ElGamal ciphertext, so the withdraw withheld
+    // authority needs a key pair, not just an address. Only the holder of this
+    // key can total the fees the mint has collected.
+    let (fee_authority_elgamal, _) = derive_confidential_keys(&payer, b"").unwrap();
+    let fee_authority_pubkey: [u8; 32] = fee_authority_elgamal.pubkey().into();
+ 
+    send(
+        &mut svm,
+        &payer,
+        &[Instruction {
+            program_id: ID,
+            accounts: accounts::CreateConfidentialFeeMint {
+                payer: payer.pubkey(),
+                mint: mint.pubkey(),
+                token_program: TOKEN_2022_PROGRAM_ID,
+                system_program: system_program::ID,
+            }
+            .to_account_metas(None),
+            data: instruction::CreateConfidentialFeeMint {
+                decimals: DECIMALS,
+                basis_points: 250,
+                maximum_fee: 5_000,
+                withdraw_withheld_authority_elgamal_pubkey: fee_authority_pubkey,
+            }
+            .data(),
+        }],
+        &[&mint],
+    );
+ 
+    let acct = svm.get_account(&mint.pubkey()).unwrap();
+    let state = StateWithExtensions::<MintState>::unpack(&acct.data).unwrap();
+    let extensions = state.get_extension_types().unwrap();
+    println!("confidential fee mint len = {}", acct.data.len());
+    println!("extensions = {extensions:?}");
+ 
+    assert!(extensions.contains(&ExtensionType::TransferFeeConfig));
+    assert!(extensions.contains(&ExtensionType::ConfidentialTransferMint));
+    assert!(extensions.contains(&ExtensionType::ConfidentialTransferFeeConfig));
+    assert_eq!(acct.data.len(), 480);
+ 
+    // All three pieces of mint side state the extension defines.
+    let fee_config = state
+        .get_extension::<ConfidentialTransferFeeConfig>()
+        .unwrap();
+ 
+    // 1. The authority is an ElGamal public key, not an address. Whoever holds
+    //    the matching secret key can decrypt every withheld fee on this mint.
+    assert_eq!(
+        fee_config.withdraw_withheld_authority_elgamal_pubkey.0,
+        fee_authority_pubkey
+    );
+ 
+    // 2. The harvest flag, which the mint authority controls.
+    println!(
+        "harvest_to_mint_enabled = {}",
+        bool::from(fee_config.harvest_to_mint_enabled)
+    );
+ 
+    // 3. The running total of fees harvested to the mint, itself a ciphertext.
+    //    It starts at zero, and only the fee authority's key can read it.
+    let harvested: ElGamalCiphertext = fee_config.withheld_amount.try_into().unwrap();
+    let harvested = fee_authority_elgamal
+        .secret()
+        .decrypt_u32(&harvested)
+        .unwrap();
+    println!("harvested so far = {harvested}");
+    assert_eq!(harvested, 0);
+}
+ 
+/// Build a fee bearing confidential mint and return it with the fee
+/// authority's ElGamal keypair, which is the only key that can read withheld
+/// fee amounts.
+fn create_fee_mint(svm: &mut LiteSVM, payer: &Keypair) -> (Keypair, ElGamalKeypair) {
+    let mint = Keypair::new();
+    let (fee_authority_elgamal, _) = derive_confidential_keys(payer, b"").unwrap();
+    let pubkey: [u8; 32] = fee_authority_elgamal.pubkey().into();
+ 
+    send(
+        svm,
+        payer,
+        &[Instruction {
+            program_id: ID,
+            accounts: accounts::CreateConfidentialFeeMint {
+                payer: payer.pubkey(),
+                mint: mint.pubkey(),
+                token_program: TOKEN_2022_PROGRAM_ID,
+                system_program: system_program::ID,
+            }
+            .to_account_metas(None),
+            data: instruction::CreateConfidentialFeeMint {
+                decimals: DECIMALS,
+                basis_points: 250,
+                maximum_fee: 5_000,
+                withdraw_withheld_authority_elgamal_pubkey: pubkey,
+            }
+            .data(),
+        }],
+        &[&mint],
+    );
+    (mint, fee_authority_elgamal)
+}
+ 
+fn harvest_enabled(svm: &LiteSVM, mint: &Pubkey) -> bool {
+    let acct = svm.get_account(mint).unwrap();
+    let state = StateWithExtensions::<MintState>::unpack(&acct.data).unwrap();
+    bool::from(
+        state
+            .get_extension::<ConfidentialTransferFeeConfig>()
+            .unwrap()
+            .harvest_to_mint_enabled,
+    )
+}
+ 
+#[test]
+fn the_mint_authority_controls_whether_accounts_may_harvest() {
+    let (mut svm, payer) = setup();
+    let (mint, _) = create_fee_mint(&mut svm, &payer);
+ 
+    // Harvesting is permissionless by default, so anyone can push an account's
+    // withheld fees to the mint. The mint authority can switch that off.
+    assert!(harvest_enabled(&svm, &mint.pubkey()));
+ 
+    send(
+        &mut svm,
+        &payer,
+        &[
+            disable_harvest_to_mint(&TOKEN_2022_PROGRAM_ID, &mint.pubkey(), &payer.pubkey(), &[])
+                .unwrap(),
+        ],
+        &[],
+    );
+    assert!(!harvest_enabled(&svm, &mint.pubkey()));
+ 
+    send(
+        &mut svm,
+        &payer,
+        &[
+            enable_harvest_to_mint(&TOKEN_2022_PROGRAM_ID, &mint.pubkey(), &payer.pubkey(), &[])
+                .unwrap(),
+        ],
+        &[],
+    );
+    assert!(harvest_enabled(&svm, &mint.pubkey()));
+}
+ 
+#[test]
+fn a_holder_on_a_fee_mint_carries_its_own_withheld_balance() {
+    let (mut svm, payer) = setup();
+    let (mint, fee_authority_elgamal) = create_fee_mint(&mut svm, &payer);
+ 
+    // Size for all three account side extensions up front. Only
+    // TransferFeeAmount is required at InitializeAccount3; the two
+    // confidential ones are written by ConfigureAccount, so the space has to
+    // be there before it runs.
+    let space = ExtensionType::try_calculate_account_len::<TokenAccountState>(&[
+        ExtensionType::TransferFeeAmount,
+        ExtensionType::ConfidentialTransferAccount,
+        ExtensionType::ConfidentialTransferFeeAmount,
+    ])
+    .unwrap();
+    assert_eq!(space, 545);
+ 
+    let ta = Keypair::new();
+    let lamports = svm.minimum_balance_for_rent_exemption(space);
+    send(
+        &mut svm,
+        &payer,
+        &[
+            solana_system_interface::instruction::create_account(
+                &payer.pubkey(),
+                &ta.pubkey(),
+                lamports,
+                space as u64,
+                &TOKEN_2022_PROGRAM_ID,
+            ),
+            initialize_account3(
+                &TOKEN_2022_PROGRAM_ID,
+                &ta.pubkey(),
+                &mint.pubkey(),
+                &payer.pubkey(),
+            )
+            .unwrap(),
+        ],
+        &[&ta],
+    );
+ 
+    let (elgamal, aes) = derive_confidential_keys(&payer, b"").unwrap();
+    let proof = build_pubkey_validity_proof_data(&elgamal).unwrap();
+    let ixs = ct_ix::configure_account(
+        &TOKEN_2022_PROGRAM_ID,
+        &ta.pubkey(),
+        &mint.pubkey(),
+        &aes.encrypt(0).into(),
+        65536,
+        &payer.pubkey(),
+        &[],
+        ProofLocation::InstructionOffset(NonZeroI8::new(1).unwrap(), &proof),
+    )
+    .unwrap();
+    send(&mut svm, &payer, &ixs, &[]);
+ 
+    let acct = svm.get_account(&ta.pubkey()).unwrap();
+    let state = StateWithExtensions::<TokenAccountState>::unpack(&acct.data).unwrap();
+    let extensions = state.get_extension_types().unwrap();
+    println!("holder extensions = {extensions:?}");
+    assert!(extensions.contains(&ExtensionType::ConfidentialTransferFeeAmount));
+ 
+    // The per account withheld balance. It is encrypted under the fee
+    // authority's key, not the holder's, so the holder cannot read what has
+    // been withheld from them.
+    let fee_amount = state
+        .get_extension::<ConfidentialTransferFeeAmount>()
+        .unwrap();
+    let withheld: ElGamalCiphertext = fee_amount.withheld_amount.try_into().unwrap();
+    let withheld = fee_authority_elgamal
+        .secret()
+        .decrypt_u32(&withheld)
+        .unwrap();
+    println!("withheld on this account = {withheld}");
+    assert_eq!(withheld, 0);
 }
