@@ -387,7 +387,11 @@ pub mod t22 {
     
      /// Creates a mint whose permanent delegate is the payer.
     pub fn create_seizable_mint(ctx: Context<CreateSeizableMint>, decimals: u8) -> Result<()> {
-        msg!("seizable mint {}", ctx.accounts.mint.key());
+        msg!("seizable mint {} with {} deccimals, permanent delegate", 
+        ctx.accounts.mint.key(),
+        decimals,
+        // ctx.accounts.payer.key()
+    );
         Ok(())
     }
  
