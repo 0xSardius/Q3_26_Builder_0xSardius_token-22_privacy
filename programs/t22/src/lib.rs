@@ -2,12 +2,13 @@
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::program::invoke;
 use anchor_spl::token_interface::{
-    initialize_mint2, mint_close_authority_initialize, spl_token_2022, transfer_fee_initialize,
-    InitializeMint2, Mint, MintCloseAuthorityInitialize, TokenInterface, TransferFeeInitialize,
+    approve, initialize_mint2, mint_close_authority_initialize, spl_token_2022, transfer_checked, transfer_fee_initialize, Approve,
+    InitializeMint2, Mint, MintCloseAuthorityInitialize, TokenInterface, TransferChecked, TransferFeeInitialize,
 };
 use spl_token_2022::{
     extension::{
         confidential_transfer::{instruction as confidential_instruction, DecryptableBalance},
+        confidential_transfer_fee::instruction as confidential_fee_instruction,
         transfer_fee::TransferFeeConfig, BaseStateWithExtensions, ExtensionType,
         StateWithExtensions,
     },
@@ -218,6 +219,104 @@ pub mod t22 {
         Ok(())
     }
 
+      /// Confidential transfer fees.
+    ///
+    /// A fee on a confidential transfer is a contradiction that has to be
+    /// resolved: the fee is a percentage of an amount nobody can see. The
+    /// resolution is that the withheld fee is itself an ElGamal ciphertext,
+    /// encrypted under a key belonging to the withdraw withheld authority, so
+    /// only that authority can total up what it is owed.
+    ///
+    /// That is why this extension takes an ElGamal public key rather than just
+    /// an address, and why it requires both TransferFeeConfig and
+    /// ConfidentialTransferMint to already be on the mint. Three extensions,
+    /// one ordering, all before InitializeMint2.
+    pub fn create_confidential_fee_mint(
+        ctx: Context<CreateConfidentialFeeMint>,
+        decimals: u8,
+        basis_points: u16,
+        maximum_fee: u64,
+        withdraw_withheld_authority_elgamal_pubkey: [u8; 32],
+    ) -> Result<()> {
+        let space = ExtensionType::try_calculate_account_len::<MintState>(&[
+            ExtensionType::TransferFeeConfig,
+            ExtensionType::ConfidentialTransferMint,
+            ExtensionType::ConfidentialTransferFeeConfig,
+        ])?;
+        let lamports = Rent::get()?.minimum_balance(space);
+ 
+        anchor_lang::system_program::create_account(
+            CpiContext::new(
+                ctx.accounts.system_program.key(),
+                anchor_lang::system_program::CreateAccount {
+                    from: ctx.accounts.payer.to_account_info(),
+                    to: ctx.accounts.mint.to_account_info(),
+                },
+            ),
+            lamports,
+            space as u64,
+            &ctx.accounts.token_program.key(),
+        )?;
+ 
+        let mint_info = ctx.accounts.mint.to_account_info();
+        let program_info = ctx.accounts.token_program.to_account_info();
+        let infos = [mint_info.clone(), program_info.clone()];
+ 
+        transfer_fee_initialize(
+            CpiContext::new(
+                ctx.accounts.token_program.key(),
+                TransferFeeInitialize {
+                    token_program_id: program_info.clone(),
+                    mint: mint_info.clone(),
+                },
+            ),
+            Some(&ctx.accounts.payer.key()),
+            Some(&ctx.accounts.payer.key()),
+            basis_points,
+            maximum_fee,
+        )?;
+ 
+        invoke(
+            &confidential_instruction::initialize_mint(
+                &ctx.accounts.token_program.key(),
+                &ctx.accounts.mint.key(),
+                Some(ctx.accounts.payer.key()),
+                true,
+                None,
+            )?,
+            &infos,
+        )?;
+ 
+        // The fee extension must come after ConfidentialTransferMint, because
+        // Token-2022 checks that the confidential mint config already exists.
+        invoke(
+            &confidential_fee_instruction::initialize_confidential_transfer_fee_config(
+                &ctx.accounts.token_program.key(),
+                &ctx.accounts.mint.key(),
+                Some(ctx.accounts.payer.key()),
+                &withdraw_withheld_authority_elgamal_pubkey.into(),
+            )?,
+            &infos,
+        )?;
+ 
+        initialize_mint2(
+            CpiContext::new(
+                ctx.accounts.token_program.key(),
+                InitializeMint2 { mint: mint_info },
+            ),
+            decimals,
+            &ctx.accounts.payer.key(),
+            None,
+        )?;
+ 
+        msg!(
+            "confidential fee mint {} at {} bytes",
+            ctx.accounts.mint.key(),
+            space
+        );
+        Ok(())
+    }
+
 
      /// Confidential: deposit.
     ///
@@ -283,6 +382,71 @@ pub mod t22 {
                 ctx.accounts.token_program.to_account_info(),
             ],
         )?;
+        Ok(())
+    }
+    
+     /// Creates a mint whose permanent delegate is the payer.
+    pub fn create_seizable_mint(ctx: Context<CreateSeizableMint>, decimals: u8) -> Result<()> {
+        msg!("seizable mint {}", ctx.accounts.mint.key());
+        Ok(())
+    }
+ 
+    /// CPI guard lesson.
+    ///
+    /// Delegates authority over a token account to this program's PDA by
+    /// cross program invoking Approve.
+    ///
+    /// This is the exact pattern a lending or escrow protocol uses, and it is
+    /// also the exact pattern a malicious program uses to drain an account it
+    /// tricked a user into signing for. Token-2022 cannot tell them apart, so
+    /// it lets the account owner decide: with the CpiGuard extension enabled,
+    /// Approve issued through a CPI fails outright. The owner can still
+    /// approve by signing a top level instruction.
+    pub fn delegate_to_program(ctx: Context<DelegateToProgram>, amount: u64) -> Result<()> {
+        approve(
+            CpiContext::new(
+                ctx.accounts.token_program.key(),
+                Approve {
+                    to: ctx.accounts.token_account.to_account_info(),
+                    delegate: ctx.accounts.delegate.to_account_info(),
+                    authority: ctx.accounts.owner.to_account_info(),
+                },
+            ),
+            amount,
+        )?;
+        msg!("delegated {} to {}", amount, ctx.accounts.delegate.key());
+        Ok(())
+    }
+ 
+    /// Permanent delegate lesson.
+    ///
+    /// Moves tokens out of an account using the mint's permanent delegate
+    /// authority. Note what is missing: no Approve was ever issued by the
+    /// holder, and the holder is not a signer here.
+    ///
+    /// A permanent delegate can move or burn tokens from every account of its
+    /// mint, forever, without consent and with no way for a holder to revoke
+    /// it. Any protocol accepting arbitrary Token-2022 mints must treat this
+    /// extension as a reason to reject the mint, not a feature to support.
+    pub fn permanent_delegate_seize(
+        ctx: Context<PermanentDelegateSeize>,
+        amount: u64,
+        decimals: u8,
+    ) -> Result<()> {
+        transfer_checked(
+            CpiContext::new(
+                ctx.accounts.token_program.key(),
+                TransferChecked {
+                    from: ctx.accounts.source.to_account_info(),
+                    mint: ctx.accounts.mint.to_account_info(),
+                    to: ctx.accounts.destination.to_account_info(),
+                    authority: ctx.accounts.permanent_delegate.to_account_info(),
+                },
+            ),
+            amount,
+            decimals,
+        )?;
+        msg!("seized {} without holder consent", amount);
         Ok(())
     }
  
@@ -408,6 +572,20 @@ pub struct CreateConfidentialMint<'info> {
 }
 
 #[derive(Accounts)]
+pub struct CreateConfidentialFeeMint<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+ 
+    /// CHECK: created and initialized in the handler.
+    #[account(mut, signer)]
+    pub mint: UncheckedAccount<'info>,
+ 
+    pub token_program: Interface<'info, TokenInterface>,
+    pub system_program: Program<'info, System>,
+}
+ 
+
+#[derive(Accounts)]
 pub struct DepositConfidential<'info> {
     /// CHECK: validated by Token-2022, which rejects any account that is not
     /// a token account for this mint configured for confidential transfers.
@@ -431,6 +609,65 @@ pub struct ApplyPendingBalance<'info> {
     pub authority: Signer<'info>,
     pub token_program: Interface<'info, TokenInterface>,
 }
+
+
+
+#[derive(Accounts)]
+#[instruction(decimals: u8)]
+pub struct CreateSeizableMint<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+ 
+    /// `permanent_delegate` is one of the seven extensions Anchor can express
+    /// as a constraint, so no manual CPI is needed here.
+    #[account(
+        init,
+        payer = payer,
+        mint::decimals = decimals,
+        mint::authority = payer,
+        mint::token_program = token_program,
+        extensions::permanent_delegate::delegate = payer,
+    )]
+    pub mint: InterfaceAccount<'info, Mint>,
+ 
+    pub token_program: Interface<'info, TokenInterface>,
+    pub system_program: Program<'info, System>,
+}
+ 
+#[derive(Accounts)]
+pub struct DelegateToProgram<'info> {
+    /// CHECK: validated by Token-2022 during Approve.
+    #[account(mut, owner = token_program.key())]
+    pub token_account: UncheckedAccount<'info>,
+ 
+    /// CHECK: any address may receive delegation; Token-2022 stores it as is.
+    pub delegate: UncheckedAccount<'info>,
+ 
+    pub owner: Signer<'info>,
+    pub token_program: Interface<'info, TokenInterface>,
+}
+ 
+#[derive(Accounts)]
+pub struct PermanentDelegateSeize<'info> {
+    /// CHECK: validated by Token-2022. Note it is not a signer.
+    #[account(mut, owner = token_program.key())]
+    pub source: UncheckedAccount<'info>,
+ 
+    /// CHECK: validated by Token-2022.
+    #[account(owner = token_program.key())]
+    pub mint: UncheckedAccount<'info>,
+ 
+    /// CHECK: validated by Token-2022.
+    #[account(mut, owner = token_program.key())]
+    pub destination: UncheckedAccount<'info>,
+ 
+    /// The mint's permanent delegate. Token-2022 checks this against the
+    /// extension; the holder has no say.
+    pub permanent_delegate: Signer<'info>,
+ 
+    pub token_program: Interface<'info, TokenInterface>,
+}
+ 
 
 #[error_code]
 pub enum MintError {
