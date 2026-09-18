@@ -15,21 +15,24 @@ Like the other confidential extensions, it must be initialized at mint creation 
 ## State
 
    #### Mint (ConfidentialTransferFeeConfig):
-        A withdraw-withheld-authority ElGamal public key. Withheld fees are encrypted under this key, so whoever holds the corresponding secret key can decrypt withheld fee amounts. Combined with the public fee parameters, this can reveal information about transfer amounts, so treat the key accordingly.
+    A withdraw-withheld-authority ElGamal public key. Withheld fees are encrypted under this key, so whoever holds the corresponding secret key can decrypt withheld fee amounts. Combined with the public fee parameters, this can reveal information about transfer amounts, so treat the key accordingly.
 
 A `harvest_to_mint_enabled` flag controlling whether accounts may harvest their withheld fees to the mint.
         The encrypted total of fees that have been harvested to the mint and are awaiting withdrawal.
    ### Token account (ConfidentialTransferFeeAmount): 
    the encrypted fee withheld on that account, waiting to be harvested to the mint.
 
-Lifecycle
+# Lifecycle
 
 The flow mirrors the non-confidential transfer fee flow:
 
-    Withhold on transfer: each confidential transfer encrypts the fee and adds it to the destination account's withheld balance.
-    Harvest to mint: HarvestWithheldTokensToMint is a permissionless instruction that moves the encrypted withheld fees from accounts into the mint. It succeeds even for frozen accounts. The mint authority can turn this on or off for the mint with EnableHarvestToMint and DisableHarvestToMint.
-    Withdraw from the mint: the withdraw-withheld authority moves the harvested fees out of the mint with WithdrawWithheldTokensFromMint.
-    Withdraw directly from accounts: the authority can also pull withheld fees straight from accounts with WithdrawWithheldTokensFromAccounts, skipping the harvest step.
+Withhold on transfer: each confidential transfer encrypts the fee and adds it to the destination account's withheld balance.
+
+Harvest to mint: `HarvestWithheldTokensToMint` is a permissionless instruction that moves the encrypted withheld fees from accounts into the mint. It succeeds even for frozen accounts. The mint authority can turn this on or off for the mint with EnableHarvestToMint and DisableHarvestToMint.
+
+Withdraw from the mint: the `withdraw-withheld` authority moves the harvested fees out of the mint with `WithdrawWithheldTokensFromMint`.
+
+Withdraw directly from accounts: the authority can also pull withheld fees straight from accounts with `WithdrawWithheldTokensFromAccounts`, skipping the harvest step.
 
 Withdrawals require zero-knowledge proofs, supplied in the same transaction or pre-verified into proof context state accounts, just like confidential transfers.
 
