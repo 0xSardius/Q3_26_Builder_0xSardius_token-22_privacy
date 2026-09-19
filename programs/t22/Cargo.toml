@@ -37,6 +37,7 @@ solana-signer = "3.0.1"
 solana-transaction = "4.1.4"
 solana-account = "4"
 solana-system-interface = "3.2"
+solana-compute-budget-interface = "3"
 zk = { package = "solana-zk-sdk", version = "7" }
 t22new = { package = "spl-token-2022-interface", version = "3.1" }
 proofgen = { package = "spl-token-confidential-transfer-proof-generation", version = "0.6" }

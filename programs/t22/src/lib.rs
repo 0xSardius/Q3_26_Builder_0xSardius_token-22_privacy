@@ -143,7 +143,7 @@ pub mod t22 {
         Ok(())
     }
 
-     /// `InterfaceAccount<'info, Mint>` looks like it gives you the whole mint.
+    /// `InterfaceAccount<'info, Mint>` looks like it gives you the whole mint.
     /// It does not. Anchor's deserializer runs
     /// `StateWithExtensions::unpack(buf).map(|t| Mint(t.base))`, which parses
     /// the TLV region and then discards it, keeping only the base struct.
@@ -219,7 +219,7 @@ pub mod t22 {
         Ok(())
     }
 
-      /// Confidential transfer fees.
+    /// Confidential transfer fees.
     ///
     /// A fee on a confidential transfer is a contradiction that has to be
     /// resolved: the fee is a percentage of an amount nobody can see. The
@@ -359,7 +359,7 @@ pub mod t22 {
     ///
     /// Note what that means: the program cannot compute this value. It has no
     /// access to the owner's key. The ciphertext is an instruction argument,
-    /// and the program is a pass through. That limitation is the lesson.
+    /// and the program is a pass through. 
     pub fn apply_pending_balance(
         ctx: Context<ApplyPendingBalance>,
         expected_pending_balance_credit_counter: u64,
@@ -395,7 +395,7 @@ pub mod t22 {
         Ok(())
     }
  
-    /// CPI guard lesson.
+    /// CPI guard.
     ///
     /// Delegates authority over a token account to this program's PDA by
     /// cross program invoking Approve.
@@ -422,7 +422,7 @@ pub mod t22 {
         Ok(())
     }
  
-    /// Permanent delegate lesson.
+    /// Permanent delegate.
     ///
     /// Moves tokens out of an account using the mint's permanent delegate
     /// authority. Note what is missing: no Approve was ever issued by the
