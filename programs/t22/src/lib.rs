@@ -29,6 +29,17 @@ const SUPPORTED_EXTENSIONS: &[ExtensionType] = &[
     ExtensionType::TransferFeeConfig,
 ];
 
+fn expected_transfer_fee(mint: &AccountInfo, amount: u64) -> Result<u64> {
+    let data = mint.try_borrow_data()?;
+    let state = StateWithExtensions::<MintState>::unpack(&data)?;
+    let config = state
+        .get_extension::<TransferFeeConfig>()
+        .map_err(|_| error!(MintError::MissingTransferFeeConfig))?;
+    config
+        .calculate_epoch_fee(Clock::get()?.epoch, amount)
+        .ok_or_else(|| error!(MintError::FeeCalculationOverflow))
+}
+
 #[program]
 pub mod t22 {
     use super::*;
@@ -145,21 +156,6 @@ pub mod t22 {
         Ok(())
     }
 
-    /// Remittance stablecoin mint.
-    ///
-    /// Stacks the four mint extensions the issuer needs, sized with
-    /// `ExtensionType::try_calculate_account_len`, every extension init
-    /// before InitializeMint2:
-    ///
-    ///   TransferFeeConfig   — protocol fee on every transfer (issuer revenue)
-    ///   MetadataPointer     — wallets read metadata from the mint itself
-    ///   DefaultAccountState — new accounts start Frozen until KYC thaws them
-    ///   MintCloseAuthority  — mint can be closed if it is decommissioned
-    ///
-    /// TransferFeeConfig and DefaultAccountState are not among Anchor's
-    /// seven `extensions::` constraints, so this cannot be declarative.
-    /// The freeze authority is set on InitializeMint2: Frozen-by-default
-    /// is a one-way door without it.
     pub fn create_remittance_mint(
         ctx: Context<CreateRemittanceMint>,
         decimals: u8,
@@ -257,6 +253,15 @@ pub mod t22 {
             space
         );
         Ok(())
+    }
+
+    pub fn quote_remittance_fee(
+        ctx: Context<QuoteRemittanceFee>,
+        amount: u64,
+    ) -> Result<u64> {
+        let fee = expected_transfer_fee(&ctx.accounts.mint.to_account_info(), amount)?;
+        msg!("expected fee {} on amount {}", fee, amount);
+        Ok(fee)
     }
 
     /// `InterfaceAccount<'info, Mint>` looks like it gives you the whole mint.
@@ -665,17 +670,21 @@ pub struct CreateRemittanceMint<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
 
-    /// Unchecked: the account does not exist yet, and Anchor has no
-    /// constraint that can describe TransferFeeConfig + DefaultAccountState
-    /// together. The handler creates and initializes it.
-    ///
-    /// CHECK: created and initialized in the handler; must sign because
-    /// the account is made at its own address.
+    /// CHECK: created and initialized in the handler.
     #[account(mut, signer)]
     pub mint: UncheckedAccount<'info>,
 
     pub token_program: Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct QuoteRemittanceFee<'info> {
+    /// CHECK: owner constrained; TransferFeeConfig required in the handler.
+    #[account(owner = token_program.key())]
+    pub mint: UncheckedAccount<'info>,
+
+    pub token_program: Interface<'info, TokenInterface>,
 }
  
 #[derive(Accounts)]
@@ -811,4 +820,8 @@ pub struct PermanentDelegateSeize<'info> {
 pub enum MintError {
     #[msg("mint carries an extension this program has not been written to handle")]
     UnsupportedExtension,
+    #[msg("mint has no TransferFeeConfig; cannot quote a protocol fee")]
+    MissingTransferFeeConfig,
+    #[msg("transfer fee calculation overflowed")]
+    FeeCalculationOverflow,
 }

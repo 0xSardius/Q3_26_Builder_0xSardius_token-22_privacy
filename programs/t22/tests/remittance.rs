@@ -1,10 +1,3 @@
-//! Week 4 remittance mint: Task 1.
-//!
-//! The issuer mint must stack TransferFeeConfig, MetadataPointer (pointed
-//! at the mint itself), DefaultAccountState (Frozen), and MintCloseAuthority.
-//! Space comes from `ExtensionType::try_calculate_account_len`. Every
-//! extension init runs before InitializeMint.
-
 use anchor_lang::{
     prelude::Pubkey,
     solana_program::{instruction::Instruction, system_program},
@@ -13,12 +6,14 @@ use anchor_lang::{
 use anchor_spl::token_interface::spl_token_2022::{
     extension::{
         default_account_state::DefaultAccountState, metadata_pointer::MetadataPointer,
-        mint_close_authority::MintCloseAuthority, transfer_fee::TransferFeeConfig,
+        mint_close_authority::MintCloseAuthority,
+        transfer_fee::{instruction::set_transfer_fee, TransferFeeConfig},
         BaseStateWithExtensions, ExtensionType, StateWithExtensions,
     },
     instruction::initialize_account3,
     state::{Account as TokenAccountState, AccountState, Mint as MintState},
 };
+use litesvm::types::TransactionMetadata;
 use litesvm::LiteSVM;
 use solana_keypair::Keypair;
 use solana_message::Message;
@@ -48,15 +43,25 @@ fn setup() -> (LiteSVM, Keypair) {
     (svm, payer)
 }
 
-fn send(svm: &mut LiteSVM, payer: &Keypair, ixs: &[Instruction], extra: &[&Keypair]) {
+fn send_ok(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    ixs: &[Instruction],
+    extra: &[&Keypair],
+) -> TransactionMetadata {
     let mut signers: Vec<&Keypair> = vec![payer];
     signers.extend_from_slice(extra);
     let blockhash = svm.latest_blockhash();
     let mut transaction = Transaction::new_unsigned(Message::new(ixs, Some(&payer.pubkey())));
     transaction.try_sign(&signers, blockhash).unwrap();
-    if let Err(err) = svm.send_transaction(transaction) {
-        panic!("transaction failed:\n{err:#?}");
+    match svm.send_transaction(transaction) {
+        Ok(meta) => meta,
+        Err(err) => panic!("transaction failed:\n{err:#?}"),
     }
+}
+
+fn send(svm: &mut LiteSVM, payer: &Keypair, ixs: &[Instruction], extra: &[&Keypair]) {
+    let _ = send_ok(svm, payer, ixs, extra);
 }
 
 fn create_remittance_mint_ix(payer: &Pubkey, mint: &Pubkey) -> Instruction {
@@ -172,7 +177,6 @@ fn new_holder_accounts_on_the_remittance_mint_start_frozen() {
         &[&mint],
     );
 
-    // TransferFeeConfig on the mint forces TransferFeeAmount onto holders.
     let holder_extensions =
         ExtensionType::get_required_init_account_extensions(&remittance_extensions());
     let space =
@@ -205,4 +209,91 @@ fn new_holder_accounts_on_the_remittance_mint_start_frozen() {
     let account = svm.get_account(&holder.pubkey()).unwrap();
     let state = StateWithExtensions::<TokenAccountState>::unpack(&account.data).unwrap();
     assert_eq!(state.base.state, AccountState::Frozen);
+}
+
+fn quote_remittance_fee_ix(mint: &Pubkey, amount: u64) -> Instruction {
+    Instruction {
+        program_id: ID,
+        accounts: accounts::QuoteRemittanceFee {
+            mint: *mint,
+            token_program: TOKEN_2022_PROGRAM_ID,
+        }
+        .to_account_metas(None),
+        data: instruction::QuoteRemittanceFee { amount }.data(),
+    }
+}
+
+fn quoted_fee(svm: &mut LiteSVM, payer: &Keypair, mint: &Pubkey, amount: u64) -> u64 {
+    let meta = send_ok(
+        svm,
+        payer,
+        &[quote_remittance_fee_ix(mint, amount)],
+        &[],
+    );
+    u64::from_le_bytes(meta.return_data.data[..8].try_into().unwrap())
+}
+
+fn live_epoch_fee(svm: &LiteSVM, mint: &Pubkey, amount: u64) -> u64 {
+    let account = svm.get_account(mint).unwrap();
+    let state = StateWithExtensions::<MintState>::unpack(&account.data).unwrap();
+    let config = state.get_extension::<TransferFeeConfig>().unwrap();
+    config.calculate_epoch_fee(0, amount).unwrap()
+}
+
+#[test]
+fn quote_matches_calculate_epoch_fee_including_the_maximum_cap() {
+    let (mut svm, payer) = setup();
+    let mint = Keypair::new();
+    send(
+        &mut svm,
+        &payer,
+        &[create_remittance_mint_ix(&payer.pubkey(), &mint.pubkey())],
+        &[&mint],
+    );
+
+    assert_eq!(quoted_fee(&mut svm, &payer, &mint.pubkey(), 10_000), 250);
+    assert_eq!(live_epoch_fee(&svm, &mint.pubkey(), 10_000), 250);
+    assert_eq!(quoted_fee(&mut svm, &payer, &mint.pubkey(), 50_000), MAXIMUM_FEE);
+}
+
+#[test]
+fn quote_uses_the_live_epoch_rate_not_the_scheduled_newer_rate() {
+    let (mut svm, payer) = setup();
+    let mint = Keypair::new();
+    send(
+        &mut svm,
+        &payer,
+        &[create_remittance_mint_ix(&payer.pubkey(), &mint.pubkey())],
+        &[&mint],
+    );
+
+    send(
+        &mut svm,
+        &payer,
+        &[set_transfer_fee(
+            &TOKEN_2022_PROGRAM_ID,
+            &mint.pubkey(),
+            &payer.pubkey(),
+            &[],
+            500,
+            MAXIMUM_FEE,
+        )
+        .unwrap()],
+        &[],
+    );
+
+    let account = svm.get_account(&mint.pubkey()).unwrap();
+    let state = StateWithExtensions::<MintState>::unpack(&account.data).unwrap();
+    let config = state.get_extension::<TransferFeeConfig>().unwrap();
+    let cached_newer = u16::from(config.newer_transfer_fee.transfer_fee_basis_points);
+    assert_eq!(cached_newer, 500);
+
+    let amount = 10_000u64;
+    let from_cached_newer = amount * u64::from(cached_newer) / 10_000;
+    assert_eq!(from_cached_newer, 500);
+
+    let fee = quoted_fee(&mut svm, &payer, &mint.pubkey(), amount);
+    assert_eq!(fee, 250);
+    assert_eq!(fee, live_epoch_fee(&svm, &mint.pubkey(), amount));
+    assert_ne!(fee, from_cached_newer);
 }
