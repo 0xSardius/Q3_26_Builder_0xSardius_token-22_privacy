@@ -30,9 +30,13 @@ const SUPPORTED_EXTENSIONS: &[ExtensionType] = &[
     ExtensionType::TransferFeeConfig,
 ];
 
+fn unpack_mint(data: &[u8]) -> Result<StateWithExtensions<'_, MintState>> {
+    Ok(StateWithExtensions::<MintState>::unpack(data)?)
+}
+
 fn expected_transfer_fee(mint: &AccountInfo, amount: u64) -> Result<u64> {
     let data = mint.try_borrow_data()?;
-    let state = StateWithExtensions::<MintState>::unpack(&data)?;
+    let state = unpack_mint(&data)?;
     let config = state
         .get_extension::<TransferFeeConfig>()
         .map_err(|_| error!(MintError::MissingTransferFeeConfig))?;
@@ -273,7 +277,7 @@ pub mod t22 {
         let fee = expected_transfer_fee(&mint_info, amount)?;
         let decimals = {
             let data = mint_info.try_borrow_data()?;
-            StateWithExtensions::<MintState>::unpack(&data)?.base.decimals
+            unpack_mint(&data)?.base.decimals
         };
 
         transfer_checked_with_fee(
@@ -612,7 +616,7 @@ pub mod t22 {
         // Not available from the typed account. Drop to the raw bytes.
         let account_info = ctx.accounts.mint.to_account_info();
         let data = account_info.try_borrow_data()?;
-        let state = StateWithExtensions::<MintState>::unpack(&data)?;
+        let state = unpack_mint(&data)?;
           
           // Available from the typed account, no extension awareness needed.
         let decimals = state.base.decimals;

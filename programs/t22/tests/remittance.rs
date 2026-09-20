@@ -1,6 +1,6 @@
 use anchor_lang::{
     prelude::Pubkey,
-    solana_program::{instruction::Instruction, system_program},
+    solana_program::{instruction::Instruction, program_pack::Pack, system_program},
     InstructionData, ToAccountMetas,
 };
 use anchor_spl::token_interface::spl_token_2022::{
@@ -500,4 +500,31 @@ fn remittance_transfer_fails_while_the_source_is_frozen() {
         logs.contains("AccountFrozen") || logs.contains("frozen"),
         "rejected for the wrong reason:\n{logs}"
     );
+}
+
+#[test]
+fn remittance_state_requires_state_with_extensions() {
+    let (mut svm, payer) = setup();
+    let mint = Keypair::new();
+    send(
+        &mut svm,
+        &payer,
+        &[create_remittance_mint_ix(&payer.pubkey(), &mint.pubkey())],
+        &[&mint],
+    );
+    let holder = holder_account(&mut svm, &payer, &mint.pubkey(), &payer.pubkey());
+
+    let mint_data = svm.get_account(&mint.pubkey()).unwrap().data;
+    assert!(MintState::unpack(&mint_data).is_err());
+    let base = MintState::unpack(&mint_data[..MintState::LEN]).unwrap();
+    assert_eq!(base.decimals, DECIMALS);
+
+    let mint_state = StateWithExtensions::<MintState>::unpack(&mint_data).unwrap();
+    assert!(mint_state.get_extension::<TransferFeeConfig>().is_ok());
+    assert!(mint_state.get_extension::<DefaultAccountState>().is_ok());
+
+    let holder_data = svm.get_account(&holder).unwrap().data;
+    assert!(TokenAccountState::unpack(&holder_data).is_err());
+    let holder_state = StateWithExtensions::<TokenAccountState>::unpack(&holder_data).unwrap();
+    assert!(holder_state.get_extension::<TransferFeeAmount>().is_ok());
 }
