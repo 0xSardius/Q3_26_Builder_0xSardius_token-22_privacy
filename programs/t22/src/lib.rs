@@ -2,8 +2,10 @@
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::program::invoke;
 use anchor_spl::token_interface::{
-    approve, initialize_mint2, mint_close_authority_initialize, spl_token_2022, transfer_checked, transfer_fee_initialize, Approve,
-    InitializeMint2, Mint, MintCloseAuthorityInitialize, TokenInterface, TransferChecked, TransferFeeInitialize,
+    approve, default_account_state_initialize, initialize_mint2, metadata_pointer_initialize,
+    mint_close_authority_initialize, spl_token_2022, transfer_checked, transfer_fee_initialize,
+    Approve, DefaultAccountStateInitialize, InitializeMint2, MetadataPointerInitialize, Mint,
+    MintCloseAuthorityInitialize, TokenInterface, TransferChecked, TransferFeeInitialize,
 };
 use spl_token_2022::{
     extension::{
@@ -12,7 +14,7 @@ use spl_token_2022::{
         transfer_fee::TransferFeeConfig, BaseStateWithExtensions, ExtensionType,
         StateWithExtensions,
     },
-    state::Mint as MintState,
+    state::{AccountState, Mint as MintState},
 };
 
 // The length of a ciphertext which is how a decryptable balance is represented in the account data
@@ -137,6 +139,120 @@ pub mod t22 {
  
         msg!(
             "mint {} created with {} bytes",
+            ctx.accounts.mint.key(),
+            space
+        );
+        Ok(())
+    }
+
+    /// Remittance stablecoin mint.
+    ///
+    /// Stacks the four mint extensions the issuer needs, sized with
+    /// `ExtensionType::try_calculate_account_len`, every extension init
+    /// before InitializeMint2:
+    ///
+    ///   TransferFeeConfig   — protocol fee on every transfer (issuer revenue)
+    ///   MetadataPointer     — wallets read metadata from the mint itself
+    ///   DefaultAccountState — new accounts start Frozen until KYC thaws them
+    ///   MintCloseAuthority  — mint can be closed if it is decommissioned
+    ///
+    /// TransferFeeConfig and DefaultAccountState are not among Anchor's
+    /// seven `extensions::` constraints, so this cannot be declarative.
+    /// The freeze authority is set on InitializeMint2: Frozen-by-default
+    /// is a one-way door without it.
+    pub fn create_remittance_mint(
+        ctx: Context<CreateRemittanceMint>,
+        decimals: u8,
+        basis_points: u16,
+        maximum_fee: u64,
+    ) -> Result<()> {
+        let extensions = [
+            ExtensionType::TransferFeeConfig,
+            ExtensionType::MetadataPointer,
+            ExtensionType::DefaultAccountState,
+            ExtensionType::MintCloseAuthority,
+        ];
+
+        let space = ExtensionType::try_calculate_account_len::<MintState>(&extensions)?;
+        let lamports = Rent::get()?.minimum_balance(space);
+
+        anchor_lang::system_program::create_account(
+            CpiContext::new(
+                ctx.accounts.system_program.key(),
+                anchor_lang::system_program::CreateAccount {
+                    from: ctx.accounts.payer.to_account_info(),
+                    to: ctx.accounts.mint.to_account_info(),
+                },
+            ),
+            lamports,
+            space as u64,
+            &ctx.accounts.token_program.key(),
+        )?;
+
+        let mint_info = ctx.accounts.mint.to_account_info();
+        let program_info = ctx.accounts.token_program.to_account_info();
+        let payer = ctx.accounts.payer.key();
+
+        transfer_fee_initialize(
+            CpiContext::new(
+                ctx.accounts.token_program.key(),
+                TransferFeeInitialize {
+                    token_program_id: program_info.clone(),
+                    mint: mint_info.clone(),
+                },
+            ),
+            Some(&payer),
+            Some(&payer),
+            basis_points,
+            maximum_fee,
+        )?;
+
+        metadata_pointer_initialize(
+            CpiContext::new(
+                ctx.accounts.token_program.key(),
+                MetadataPointerInitialize {
+                    token_program_id: program_info.clone(),
+                    mint: mint_info.clone(),
+                },
+            ),
+            Some(payer),
+            Some(ctx.accounts.mint.key()),
+        )?;
+
+        default_account_state_initialize(
+            CpiContext::new(
+                ctx.accounts.token_program.key(),
+                DefaultAccountStateInitialize {
+                    token_program_id: program_info.clone(),
+                    mint: mint_info.clone(),
+                },
+            ),
+            &AccountState::Frozen,
+        )?;
+
+        mint_close_authority_initialize(
+            CpiContext::new(
+                ctx.accounts.token_program.key(),
+                MintCloseAuthorityInitialize {
+                    token_program_id: program_info,
+                    mint: mint_info.clone(),
+                },
+            ),
+            Some(&payer),
+        )?;
+
+        initialize_mint2(
+            CpiContext::new(
+                ctx.accounts.token_program.key(),
+                InitializeMint2 { mint: mint_info },
+            ),
+            decimals,
+            &payer,
+            Some(&payer),
+        )?;
+
+        msg!(
+            "remittance mint {} created with {} bytes",
             ctx.accounts.mint.key(),
             space
         );
@@ -540,6 +656,24 @@ pub struct CreateMintWithFee<'info> {
     #[account(mut, signer)]
     pub mint: UncheckedAccount<'info>,
  
+    pub token_program: Interface<'info, TokenInterface>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct CreateRemittanceMint<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    /// Unchecked: the account does not exist yet, and Anchor has no
+    /// constraint that can describe TransferFeeConfig + DefaultAccountState
+    /// together. The handler creates and initializes it.
+    ///
+    /// CHECK: created and initialized in the handler; must sign because
+    /// the account is made at its own address.
+    #[account(mut, signer)]
+    pub mint: UncheckedAccount<'info>,
+
     pub token_program: Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
 }
