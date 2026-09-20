@@ -3,9 +3,10 @@ use anchor_lang::prelude::*;
 use anchor_lang::solana_program::program::invoke;
 use anchor_spl::token_interface::{
     approve, default_account_state_initialize, initialize_mint2, metadata_pointer_initialize,
-    mint_close_authority_initialize, spl_token_2022, transfer_checked, transfer_fee_initialize,
-    Approve, DefaultAccountStateInitialize, InitializeMint2, MetadataPointerInitialize, Mint,
-    MintCloseAuthorityInitialize, TokenInterface, TransferChecked, TransferFeeInitialize,
+    mint_close_authority_initialize, spl_token_2022, transfer_checked, transfer_checked_with_fee,
+    transfer_fee_initialize, Approve, DefaultAccountStateInitialize, InitializeMint2,
+    MetadataPointerInitialize, Mint, MintCloseAuthorityInitialize, TokenInterface, TransferChecked,
+    TransferCheckedWithFee, TransferFeeInitialize,
 };
 use spl_token_2022::{
     extension::{
@@ -262,6 +263,34 @@ pub mod t22 {
         let fee = expected_transfer_fee(&ctx.accounts.mint.to_account_info(), amount)?;
         msg!("expected fee {} on amount {}", fee, amount);
         Ok(fee)
+    }
+
+    pub fn transfer_with_protocol_fee(
+        ctx: Context<TransferWithProtocolFee>,
+        amount: u64,
+    ) -> Result<()> {
+        let mint_info = ctx.accounts.mint.to_account_info();
+        let fee = expected_transfer_fee(&mint_info, amount)?;
+        let decimals = {
+            let data = mint_info.try_borrow_data()?;
+            StateWithExtensions::<MintState>::unpack(&data)?.base.decimals
+        };
+
+        transfer_checked_with_fee(
+            CpiContext::new(
+                ctx.accounts.token_program.key(),
+                TransferCheckedWithFee {
+                    token_program_id: ctx.accounts.token_program.to_account_info(),
+                    source: ctx.accounts.source.to_account_info(),
+                    mint: mint_info,
+                    destination: ctx.accounts.destination.to_account_info(),
+                    authority: ctx.accounts.authority.to_account_info(),
+                },
+            ),
+            amount,
+            decimals,
+            fee,
+        )
     }
 
     /// `InterfaceAccount<'info, Mint>` looks like it gives you the whole mint.
@@ -686,7 +715,25 @@ pub struct QuoteRemittanceFee<'info> {
 
     pub token_program: Interface<'info, TokenInterface>,
 }
- 
+
+#[derive(Accounts)]
+pub struct TransferWithProtocolFee<'info> {
+    /// CHECK: Token-2022 validates the source account.
+    #[account(mut, owner = token_program.key())]
+    pub source: UncheckedAccount<'info>,
+
+    /// CHECK: owner constrained; fee and decimals read via StateWithExtensions.
+    #[account(owner = token_program.key())]
+    pub mint: UncheckedAccount<'info>,
+
+    /// CHECK: Token-2022 validates the destination account.
+    #[account(mut, owner = token_program.key())]
+    pub destination: UncheckedAccount<'info>,
+
+    pub authority: Signer<'info>,
+    pub token_program: Interface<'info, TokenInterface>,
+}
+
 #[derive(Accounts)]
 pub struct AssertSupportedMint<'info> {
     /// Unchecked so the account is parsed exactly once, in the handler.

@@ -7,10 +7,10 @@ use anchor_spl::token_interface::spl_token_2022::{
     extension::{
         default_account_state::DefaultAccountState, metadata_pointer::MetadataPointer,
         mint_close_authority::MintCloseAuthority,
-        transfer_fee::{instruction::set_transfer_fee, TransferFeeConfig},
+        transfer_fee::{instruction::set_transfer_fee, TransferFeeAmount, TransferFeeConfig},
         BaseStateWithExtensions, ExtensionType, StateWithExtensions,
     },
-    instruction::initialize_account3,
+    instruction::{freeze_account, initialize_account3, mint_to, thaw_account},
     state::{Account as TokenAccountState, AccountState, Mint as MintState},
 };
 use litesvm::types::TransactionMetadata;
@@ -296,4 +296,208 @@ fn quote_uses_the_live_epoch_rate_not_the_scheduled_newer_rate() {
     assert_eq!(fee, 250);
     assert_eq!(fee, live_epoch_fee(&svm, &mint.pubkey(), amount));
     assert_ne!(fee, from_cached_newer);
+}
+
+fn holder_account(svm: &mut LiteSVM, payer: &Keypair, mint: &Pubkey, owner: &Pubkey) -> Pubkey {
+    let extensions = ExtensionType::get_required_init_account_extensions(&remittance_extensions());
+    let space = ExtensionType::try_calculate_account_len::<TokenAccountState>(&extensions).unwrap();
+    let holder = Keypair::new();
+    let lamports = svm.minimum_balance_for_rent_exemption(space);
+    send(
+        svm,
+        payer,
+        &[
+            solana_system_interface::instruction::create_account(
+                &payer.pubkey(),
+                &holder.pubkey(),
+                lamports,
+                space as u64,
+                &TOKEN_2022_PROGRAM_ID,
+            ),
+            initialize_account3(&TOKEN_2022_PROGRAM_ID, &holder.pubkey(), mint, owner).unwrap(),
+        ],
+        &[&holder],
+    );
+    holder.pubkey()
+}
+
+fn thaw(svm: &mut LiteSVM, payer: &Keypair, mint: &Pubkey, account: &Pubkey) {
+    send(
+        svm,
+        payer,
+        &[thaw_account(
+            &TOKEN_2022_PROGRAM_ID,
+            account,
+            mint,
+            &payer.pubkey(),
+            &[],
+        )
+        .unwrap()],
+        &[],
+    );
+}
+
+fn read_holder(svm: &LiteSVM, account: &Pubkey) -> (u64, u64, AccountState) {
+    let acct = svm.get_account(account).unwrap();
+    let state = StateWithExtensions::<TokenAccountState>::unpack(&acct.data).unwrap();
+    let withheld = u64::from(
+        state
+            .get_extension::<TransferFeeAmount>()
+            .unwrap()
+            .withheld_amount,
+    );
+    (state.base.amount, withheld, state.base.state)
+}
+
+fn transfer_with_protocol_fee_ix(
+    source: &Pubkey,
+    mint: &Pubkey,
+    destination: &Pubkey,
+    authority: &Pubkey,
+    amount: u64,
+) -> Instruction {
+    Instruction {
+        program_id: ID,
+        accounts: accounts::TransferWithProtocolFee {
+            source: *source,
+            mint: *mint,
+            destination: *destination,
+            authority: *authority,
+            token_program: TOKEN_2022_PROGRAM_ID,
+        }
+        .to_account_metas(None),
+        data: instruction::TransferWithProtocolFee { amount }.data(),
+    }
+}
+
+fn send_expecting_failure(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    ixs: &[Instruction],
+    extra: &[&Keypair],
+) -> String {
+    let mut signers: Vec<&Keypair> = vec![payer];
+    signers.extend_from_slice(extra);
+    let blockhash = svm.latest_blockhash();
+    let mut transaction = Transaction::new_unsigned(Message::new(ixs, Some(&payer.pubkey())));
+    transaction.try_sign(&signers, blockhash).unwrap();
+    match svm.send_transaction(transaction) {
+        Ok(_) => panic!("expected the transaction to fail, but it succeeded"),
+        Err(err) => format!("{err:#?}"),
+    }
+}
+
+#[test]
+fn remittance_transfer_withholds_the_live_epoch_fee() {
+    let (mut svm, payer) = setup();
+    let mint = Keypair::new();
+    send(
+        &mut svm,
+        &payer,
+        &[create_remittance_mint_ix(&payer.pubkey(), &mint.pubkey())],
+        &[&mint],
+    );
+
+    let source = holder_account(&mut svm, &payer, &mint.pubkey(), &payer.pubkey());
+    let dest = holder_account(&mut svm, &payer, &mint.pubkey(), &payer.pubkey());
+    thaw(&mut svm, &payer, &mint.pubkey(), &source);
+    thaw(&mut svm, &payer, &mint.pubkey(), &dest);
+
+    send(
+        &mut svm,
+        &payer,
+        &[mint_to(
+            &TOKEN_2022_PROGRAM_ID,
+            &mint.pubkey(),
+            &source,
+            &payer.pubkey(),
+            &[],
+            10_000,
+        )
+        .unwrap()],
+        &[],
+    );
+
+    let amount = 10_000u64;
+    let fee = live_epoch_fee(&svm, &mint.pubkey(), amount);
+    assert_eq!(fee, 250);
+
+    send(
+        &mut svm,
+        &payer,
+        &[transfer_with_protocol_fee_ix(
+            &source,
+            &mint.pubkey(),
+            &dest,
+            &payer.pubkey(),
+            amount,
+        )],
+        &[],
+    );
+
+    let (source_amount, source_withheld, _) = read_holder(&svm, &source);
+    let (dest_amount, dest_withheld, _) = read_holder(&svm, &dest);
+    assert_eq!(source_amount, 0);
+    assert_eq!(source_withheld, 0);
+    assert_eq!(dest_amount, amount - fee);
+    assert_eq!(dest_withheld, fee);
+}
+
+#[test]
+fn remittance_transfer_fails_while_the_source_is_frozen() {
+    let (mut svm, payer) = setup();
+    let mint = Keypair::new();
+    send(
+        &mut svm,
+        &payer,
+        &[create_remittance_mint_ix(&payer.pubkey(), &mint.pubkey())],
+        &[&mint],
+    );
+
+    let source = holder_account(&mut svm, &payer, &mint.pubkey(), &payer.pubkey());
+    let dest = holder_account(&mut svm, &payer, &mint.pubkey(), &payer.pubkey());
+    thaw(&mut svm, &payer, &mint.pubkey(), &source);
+    thaw(&mut svm, &payer, &mint.pubkey(), &dest);
+
+    send(
+        &mut svm,
+        &payer,
+        &[
+            mint_to(
+                &TOKEN_2022_PROGRAM_ID,
+                &mint.pubkey(),
+                &source,
+                &payer.pubkey(),
+                &[],
+                10_000,
+            )
+            .unwrap(),
+            freeze_account(
+                &TOKEN_2022_PROGRAM_ID,
+                &source,
+                &mint.pubkey(),
+                &payer.pubkey(),
+                &[],
+            )
+            .unwrap(),
+        ],
+        &[],
+    );
+
+    let logs = send_expecting_failure(
+        &mut svm,
+        &payer,
+        &[transfer_with_protocol_fee_ix(
+            &source,
+            &mint.pubkey(),
+            &dest,
+            &payer.pubkey(),
+            10_000,
+        )],
+        &[],
+    );
+    assert!(
+        logs.contains("AccountFrozen") || logs.contains("frozen"),
+        "rejected for the wrong reason:\n{logs}"
+    );
 }
