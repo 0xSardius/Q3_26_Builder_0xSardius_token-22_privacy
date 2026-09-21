@@ -16,11 +16,14 @@ use t22new::{
         confidential_transfer::ConfidentialTransferAccount, BaseStateWithExtensions, ExtensionType,
         StateWithExtensions,
     },
-    instruction::initialize_account3,
+    instruction::{initialize_account3, mint_to},
     state::Account as TokenAccountState,
 };
 use zk::{
-    encryption::derivation::derive_confidential_keys,
+    encryption::{
+        derivation::derive_confidential_keys,
+        elgamal::{ElGamalCiphertext, ElGamalKeypair},
+    },
     zk_elgamal_proof_program::pubkey_validity::build_pubkey_validity_proof_data,
 };
 use zkif::{
@@ -179,7 +182,7 @@ fn stage_pubkey_proof(
     svm: &mut LiteSVM,
     payer: &Keypair,
     owner: &Keypair,
-) -> ([u8; AE_CIPHERTEXT_LEN], Pubkey) {
+) -> (ElGamalKeypair, [u8; AE_CIPHERTEXT_LEN], Pubkey) {
     let (elgamal, aes) = derive_confidential_keys(owner, b"").unwrap();
     let proof = build_pubkey_validity_proof_data(&elgamal).unwrap();
     let ctx = stage_proof(
@@ -188,7 +191,66 @@ fn stage_pubkey_proof(
         ProofInstruction::VerifyPubkeyValidity,
         &proof,
     );
-    (aes.encrypt(0).to_bytes(), ctx)
+    (elgamal, aes.encrypt(0).to_bytes(), ctx)
+}
+
+fn thaw_ix(token_account: &Pubkey, mint: &Pubkey, freeze_authority: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: ID,
+        accounts: accounts::ThawAfterKyc {
+            token_account: *token_account,
+            mint: *mint,
+            freeze_authority: *freeze_authority,
+            token_program: TOKEN_2022_PROGRAM_ID,
+        }
+        .to_account_metas(None),
+        data: instruction::ThawAfterKyc {}.data(),
+    }
+}
+
+fn deposit_ix(
+    token_account: &Pubkey,
+    mint: &Pubkey,
+    authority: &Pubkey,
+    amount: u64,
+) -> Instruction {
+    Instruction {
+        program_id: ID,
+        accounts: accounts::DepositConfidential {
+            token_account: *token_account,
+            mint: *mint,
+            authority: *authority,
+            token_program: TOKEN_2022_PROGRAM_ID,
+        }
+        .to_account_metas(None),
+        data: instruction::DepositConfidential {
+            amount,
+            decimals: DECIMALS,
+        }
+        .data(),
+    }
+}
+
+fn public_amount(svm: &LiteSVM, account: &Pubkey) -> u64 {
+    let acct = svm.get_account(account).unwrap();
+    StateWithExtensions::<TokenAccountState>::unpack(&acct.data)
+        .unwrap()
+        .base
+        .amount
+}
+
+fn pending_balance(ct: &ConfidentialTransferAccount, elgamal: &ElGamalKeypair) -> u64 {
+    let lo: ElGamalCiphertext = ct.pending_balance_lo.try_into().unwrap();
+    let hi: ElGamalCiphertext = ct.pending_balance_hi.try_into().unwrap();
+    let lo = elgamal.secret().decrypt_u32(&lo).unwrap();
+    let hi = elgamal.secret().decrypt_u32(&hi).unwrap();
+    lo + (hi << 16)
+}
+
+fn read_ct(svm: &LiteSVM, account: &Pubkey) -> ConfidentialTransferAccount {
+    let acct = svm.get_account(account).unwrap();
+    let state = StateWithExtensions::<TokenAccountState>::unpack(&acct.data).unwrap();
+    *state.get_extension::<ConfidentialTransferAccount>().unwrap()
 }
 
 fn configure_ix(
@@ -250,7 +312,7 @@ fn anyone_can_create_the_account_only_the_owner_can_configure() {
     svm.airdrop(&owner.pubkey(), 10_000_000_000).unwrap();
 
     let account = create_holder_account(&mut svm, &payer, &mint.pubkey(), &owner.pubkey());
-    let (zero_balance, proof_ctx) = stage_pubkey_proof(&mut svm, &payer, &owner);
+    let (_elgamal, zero_balance, proof_ctx) = stage_pubkey_proof(&mut svm, &payer, &owner);
 
     let logs = send_expecting_failure(
         &mut svm,
@@ -291,7 +353,7 @@ fn manual_approve_is_required_after_configure() {
     let mint = create_v2_mint(&mut svm, &payer);
     let owner = payer.insecure_clone();
     let account = create_holder_account(&mut svm, &payer, &mint.pubkey(), &owner.pubkey());
-    let (zero_balance, proof_ctx) = stage_pubkey_proof(&mut svm, &payer, &owner);
+    let (_elgamal, zero_balance, proof_ctx) = stage_pubkey_proof(&mut svm, &payer, &owner);
 
     send(
         &mut svm,
@@ -314,4 +376,107 @@ fn manual_approve_is_required_after_configure() {
         &[],
     );
     assert!(ct_approved(&svm, &account));
+}
+
+fn fund_public(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    mint: &Pubkey,
+    account: &Pubkey,
+    amount: u64,
+) {
+    send(
+        svm,
+        payer,
+        &[
+            thaw_ix(account, mint, &payer.pubkey()),
+            mint_to(
+                &TOKEN_2022_PROGRAM_ID,
+                mint,
+                account,
+                &payer.pubkey(),
+                &[],
+                amount,
+            )
+            .unwrap(),
+        ],
+        &[],
+    );
+}
+
+#[test]
+fn deposit_is_rejected_until_the_account_is_approved() {
+    let (mut svm, payer) = setup();
+    let mint = create_v2_mint(&mut svm, &payer);
+    let owner = payer.insecure_clone();
+    let account = create_holder_account(&mut svm, &payer, &mint.pubkey(), &owner.pubkey());
+    let (_elgamal, zero_balance, proof_ctx) = stage_pubkey_proof(&mut svm, &payer, &owner);
+
+    send(
+        &mut svm,
+        &payer,
+        &[configure_ix(
+            &account,
+            &mint.pubkey(),
+            &proof_ctx,
+            &owner.pubkey(),
+            zero_balance,
+        )],
+        &[],
+    );
+    fund_public(&mut svm, &payer, &mint.pubkey(), &account, 10_000);
+
+    let logs = send_expecting_failure(
+        &mut svm,
+        &payer,
+        &[deposit_ix(&account, &mint.pubkey(), &owner.pubkey(), 10_000)],
+        &[],
+    );
+    assert!(
+        logs.contains("approved") || logs.contains("0x13") || logs.contains("custom program error"),
+        "unapproved deposit rejected for the wrong reason:\n{logs}"
+    );
+    assert_eq!(public_amount(&svm, &account), 10_000);
+}
+
+#[test]
+fn deposit_moves_public_tokens_into_pending_confidential() {
+    let (mut svm, payer) = setup();
+    let mint = create_v2_mint(&mut svm, &payer);
+    let owner = payer.insecure_clone();
+    let account = create_holder_account(&mut svm, &payer, &mint.pubkey(), &owner.pubkey());
+    let (elgamal, zero_balance, proof_ctx) = stage_pubkey_proof(&mut svm, &payer, &owner);
+
+    send(
+        &mut svm,
+        &payer,
+        &[configure_ix(
+            &account,
+            &mint.pubkey(),
+            &proof_ctx,
+            &owner.pubkey(),
+            zero_balance,
+        )],
+        &[],
+    );
+    send(
+        &mut svm,
+        &payer,
+        &[approve_ix(&account, &mint.pubkey(), &payer.pubkey())],
+        &[],
+    );
+    fund_public(&mut svm, &payer, &mint.pubkey(), &account, 10_000);
+    assert_eq!(public_amount(&svm, &account), 10_000);
+
+    send(
+        &mut svm,
+        &payer,
+        &[deposit_ix(&account, &mint.pubkey(), &owner.pubkey(), 10_000)],
+        &[],
+    );
+
+    let ct = read_ct(&svm, &account);
+    assert_eq!(public_amount(&svm, &account), 0);
+    assert_eq!(pending_balance(&ct, &elgamal), 10_000);
+    assert_eq!(u64::from(ct.pending_balance_credit_counter), 1);
 }
