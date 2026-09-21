@@ -25,6 +25,7 @@ custom-panic = []
 [dependencies]
 anchor-lang = "1.2.0"
 anchor-spl = { version = "1.2.0", features = ["token_2022", "token_2022_extensions"] }
+spl-token-confidential-transfer-proof-extraction = "0.5.1"
 
 
 

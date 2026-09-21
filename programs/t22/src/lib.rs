@@ -18,6 +18,7 @@ use spl_token_2022::{
     },
     state::{AccountState, Mint as MintState},
 };
+use spl_token_confidential_transfer_proof_extraction::instruction::ProofLocation;
 
 // The length of a ciphertext which is how a decryptable balance is represented in the account data
 pub const AE_CIPHERTEXT_LEN: usize = 36;
@@ -438,6 +439,55 @@ pub mod t22 {
                 authority: ctx.accounts.freeze_authority.to_account_info(),
             },
         ))
+    }
+
+    pub fn configure_confidential_account(
+        ctx: Context<ConfigureConfidentialAccount>,
+        decryptable_zero_balance: [u8; AE_CIPHERTEXT_LEN],
+        maximum_pending_balance_credit_counter: u64,
+    ) -> Result<()> {
+        let balance = DecryptableBalance::from(decryptable_zero_balance);
+        let ix = confidential_instruction::inner_configure_account(
+            &ctx.accounts.token_program.key(),
+            &ctx.accounts.token_account.key(),
+            &ctx.accounts.mint.key(),
+            &balance,
+            maximum_pending_balance_credit_counter,
+            &ctx.accounts.owner.key(),
+            &[],
+            ProofLocation::ContextStateAccount(ctx.accounts.proof_context.key),
+        )?;
+        invoke(
+            &ix,
+            &[
+                ctx.accounts.token_account.to_account_info(),
+                ctx.accounts.mint.to_account_info(),
+                ctx.accounts.proof_context.to_account_info(),
+                ctx.accounts.owner.to_account_info(),
+                ctx.accounts.token_program.to_account_info(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn approve_confidential_account(ctx: Context<ApproveConfidentialAccount>) -> Result<()> {
+        let ix = confidential_instruction::approve_account(
+            &ctx.accounts.token_program.key(),
+            &ctx.accounts.token_account.key(),
+            &ctx.accounts.mint.key(),
+            &ctx.accounts.confidential_authority.key(),
+            &[],
+        )?;
+        invoke(
+            &ix,
+            &[
+                ctx.accounts.token_account.to_account_info(),
+                ctx.accounts.mint.to_account_info(),
+                ctx.accounts.confidential_authority.to_account_info(),
+                ctx.accounts.token_program.to_account_info(),
+            ],
+        )?;
+        Ok(())
     }
 
     /// `InterfaceAccount<'info, Mint>` looks like it gives you the whole mint.
@@ -905,6 +955,37 @@ pub struct ThawAfterKyc<'info> {
     pub mint: UncheckedAccount<'info>,
 
     pub freeze_authority: Signer<'info>,
+    pub token_program: Interface<'info, TokenInterface>,
+}
+
+#[derive(Accounts)]
+pub struct ConfigureConfidentialAccount<'info> {
+    /// CHECK: Token-2022 validates the token account.
+    #[account(mut, owner = token_program.key())]
+    pub token_account: UncheckedAccount<'info>,
+
+    /// CHECK: Token-2022 validates the mint.
+    #[account(owner = token_program.key())]
+    pub mint: UncheckedAccount<'info>,
+
+    /// CHECK: pubkey-validity proof context, already verified.
+    pub proof_context: UncheckedAccount<'info>,
+
+    pub owner: Signer<'info>,
+    pub token_program: Interface<'info, TokenInterface>,
+}
+
+#[derive(Accounts)]
+pub struct ApproveConfidentialAccount<'info> {
+    /// CHECK: Token-2022 validates the token account.
+    #[account(mut, owner = token_program.key())]
+    pub token_account: UncheckedAccount<'info>,
+
+    /// CHECK: Token-2022 validates the mint.
+    #[account(owner = token_program.key())]
+    pub mint: UncheckedAccount<'info>,
+
+    pub confidential_authority: Signer<'info>,
     pub token_program: Interface<'info, TokenInterface>,
 }
 
