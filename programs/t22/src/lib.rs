@@ -3,10 +3,10 @@ use anchor_lang::prelude::*;
 use anchor_lang::solana_program::program::invoke;
 use anchor_spl::token_interface::{
     approve, default_account_state_initialize, initialize_mint2, metadata_pointer_initialize,
-    mint_close_authority_initialize, spl_token_2022, transfer_checked, transfer_checked_with_fee,
-    transfer_fee_initialize, Approve, DefaultAccountStateInitialize, InitializeMint2,
-    MetadataPointerInitialize, Mint, MintCloseAuthorityInitialize, TokenInterface, TransferChecked,
-    TransferCheckedWithFee, TransferFeeInitialize,
+    mint_close_authority_initialize, spl_token_2022, thaw_account, transfer_checked,
+    transfer_checked_with_fee, transfer_fee_initialize, Approve, DefaultAccountStateInitialize,
+    InitializeMint2, MetadataPointerInitialize, Mint, MintCloseAuthorityInitialize, ThawAccount,
+    TokenInterface, TransferChecked, TransferCheckedWithFee, TransferFeeInitialize,
 };
 use spl_token_2022::{
     extension::{
@@ -295,6 +295,17 @@ pub mod t22 {
             decimals,
             fee,
         )
+    }
+
+    pub fn thaw_after_kyc(ctx: Context<ThawAfterKyc>) -> Result<()> {
+        thaw_account(CpiContext::new(
+            ctx.accounts.token_program.key(),
+            ThawAccount {
+                account: ctx.accounts.token_account.to_account_info(),
+                mint: ctx.accounts.mint.to_account_info(),
+                authority: ctx.accounts.freeze_authority.to_account_info(),
+            },
+        ))
     }
 
     /// `InterfaceAccount<'info, Mint>` looks like it gives you the whole mint.
@@ -735,6 +746,20 @@ pub struct TransferWithProtocolFee<'info> {
     pub destination: UncheckedAccount<'info>,
 
     pub authority: Signer<'info>,
+    pub token_program: Interface<'info, TokenInterface>,
+}
+
+#[derive(Accounts)]
+pub struct ThawAfterKyc<'info> {
+    /// CHECK: Token-2022 validates the token account.
+    #[account(mut, owner = token_program.key())]
+    pub token_account: UncheckedAccount<'info>,
+
+    /// CHECK: Token-2022 checks freeze authority against this mint.
+    #[account(owner = token_program.key())]
+    pub mint: UncheckedAccount<'info>,
+
+    pub freeze_authority: Signer<'info>,
     pub token_program: Interface<'info, TokenInterface>,
 }
 

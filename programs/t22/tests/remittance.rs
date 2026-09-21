@@ -10,7 +10,7 @@ use anchor_spl::token_interface::spl_token_2022::{
         transfer_fee::{instruction::set_transfer_fee, TransferFeeAmount, TransferFeeConfig},
         BaseStateWithExtensions, ExtensionType, StateWithExtensions,
     },
-    instruction::{freeze_account, initialize_account3, mint_to, thaw_account},
+    instruction::{freeze_account, initialize_account3, mint_to},
     state::{Account as TokenAccountState, AccountState, Mint as MintState},
 };
 use litesvm::types::TransactionMetadata;
@@ -321,20 +321,33 @@ fn holder_account(svm: &mut LiteSVM, payer: &Keypair, mint: &Pubkey, owner: &Pub
     holder.pubkey()
 }
 
+fn thaw_after_kyc_ix(token_account: &Pubkey, mint: &Pubkey, freeze_authority: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: ID,
+        accounts: accounts::ThawAfterKyc {
+            token_account: *token_account,
+            mint: *mint,
+            freeze_authority: *freeze_authority,
+            token_program: TOKEN_2022_PROGRAM_ID,
+        }
+        .to_account_metas(None),
+        data: instruction::ThawAfterKyc {}.data(),
+    }
+}
+
 fn thaw(svm: &mut LiteSVM, payer: &Keypair, mint: &Pubkey, account: &Pubkey) {
     send(
         svm,
         payer,
-        &[thaw_account(
-            &TOKEN_2022_PROGRAM_ID,
-            account,
-            mint,
-            &payer.pubkey(),
-            &[],
-        )
-        .unwrap()],
+        &[thaw_after_kyc_ix(account, mint, &payer.pubkey())],
         &[],
     );
+}
+
+fn mint_default_state(svm: &LiteSVM, mint: &Pubkey) -> u8 {
+    let account = svm.get_account(mint).unwrap();
+    let state = StateWithExtensions::<MintState>::unpack(&account.data).unwrap();
+    state.get_extension::<DefaultAccountState>().unwrap().state
 }
 
 fn read_holder(svm: &LiteSVM, account: &Pubkey) -> (u64, u64, AccountState) {
@@ -527,4 +540,59 @@ fn remittance_state_requires_state_with_extensions() {
     assert!(TokenAccountState::unpack(&holder_data).is_err());
     let holder_state = StateWithExtensions::<TokenAccountState>::unpack(&holder_data).unwrap();
     assert!(holder_state.get_extension::<TransferFeeAmount>().is_ok());
+}
+
+#[test]
+fn thaw_after_kyc_unfreezes_one_account_without_changing_mint_default() {
+    let (mut svm, payer) = setup();
+    let mint = Keypair::new();
+    send(
+        &mut svm,
+        &payer,
+        &[create_remittance_mint_ix(&payer.pubkey(), &mint.pubkey())],
+        &[&mint],
+    );
+
+    let cleared = holder_account(&mut svm, &payer, &mint.pubkey(), &payer.pubkey());
+    let pending = holder_account(&mut svm, &payer, &mint.pubkey(), &payer.pubkey());
+
+    assert_eq!(read_holder(&svm, &cleared).2, AccountState::Frozen);
+    assert_eq!(mint_default_state(&svm, &mint.pubkey()), AccountState::Frozen as u8);
+
+    thaw(&mut svm, &payer, &mint.pubkey(), &cleared);
+
+    assert_eq!(read_holder(&svm, &cleared).2, AccountState::Initialized);
+    assert_eq!(read_holder(&svm, &pending).2, AccountState::Frozen);
+    assert_eq!(mint_default_state(&svm, &mint.pubkey()), AccountState::Frozen as u8);
+
+    let later = holder_account(&mut svm, &payer, &mint.pubkey(), &payer.pubkey());
+    assert_eq!(read_holder(&svm, &later).2, AccountState::Frozen);
+}
+
+#[test]
+fn thaw_after_kyc_rejects_a_non_freeze_authority() {
+    let (mut svm, payer) = setup();
+    let mint = Keypair::new();
+    send(
+        &mut svm,
+        &payer,
+        &[create_remittance_mint_ix(&payer.pubkey(), &mint.pubkey())],
+        &[&mint],
+    );
+
+    let holder = holder_account(&mut svm, &payer, &mint.pubkey(), &payer.pubkey());
+    let impostor = Keypair::new();
+    svm.airdrop(&impostor.pubkey(), 1_000_000_000).unwrap();
+
+    let logs = send_expecting_failure(
+        &mut svm,
+        &impostor,
+        &[thaw_after_kyc_ix(&holder, &mint.pubkey(), &impostor.pubkey())],
+        &[],
+    );
+    assert!(
+        logs.contains("owner") || logs.contains("authority") || logs.contains("0x4"),
+        "rejected for the wrong reason:\n{logs}"
+    );
+    assert_eq!(read_holder(&svm, &holder).2, AccountState::Frozen);
 }
