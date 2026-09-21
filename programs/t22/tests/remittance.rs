@@ -5,8 +5,9 @@ use anchor_lang::{
 };
 use anchor_spl::token_interface::spl_token_2022::{
     extension::{
+        confidential_transfer::{instruction as ct_ix, ConfidentialTransferMint},
         default_account_state::DefaultAccountState, metadata_pointer::MetadataPointer,
-        mint_close_authority::MintCloseAuthority,
+        mint_close_authority::MintCloseAuthority, permanent_delegate::PermanentDelegate,
         transfer_fee::{instruction::set_transfer_fee, TransferFeeAmount, TransferFeeConfig},
         BaseStateWithExtensions, ExtensionType, StateWithExtensions,
     },
@@ -595,4 +596,111 @@ fn thaw_after_kyc_rejects_a_non_freeze_authority() {
         "rejected for the wrong reason:\n{logs}"
     );
     assert_eq!(read_holder(&svm, &holder).2, AccountState::Frozen);
+}
+
+fn reissue_remittance_mint_ix(payer: &Pubkey, mint: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: ID,
+        accounts: accounts::ReissueRemittanceMint {
+            payer: *payer,
+            mint: *mint,
+            token_program: TOKEN_2022_PROGRAM_ID,
+            system_program: system_program::ID,
+        }
+        .to_account_metas(None),
+        data: instruction::ReissueRemittanceMint {
+            decimals: DECIMALS,
+            basis_points: BASIS_POINTS,
+            maximum_fee: MAXIMUM_FEE,
+            withdraw_withheld_authority_elgamal_pubkey: [0u8; 32],
+        }
+        .data(),
+    }
+}
+
+fn reissue_extensions() -> [ExtensionType; 7] {
+    [
+        ExtensionType::TransferFeeConfig,
+        ExtensionType::MetadataPointer,
+        ExtensionType::DefaultAccountState,
+        ExtensionType::MintCloseAuthority,
+        ExtensionType::PermanentDelegate,
+        ExtensionType::ConfidentialTransferMint,
+        ExtensionType::ConfidentialTransferFeeConfig,
+    ]
+}
+
+fn mint_extensions(svm: &LiteSVM, mint: &Pubkey) -> Vec<ExtensionType> {
+    let account = svm.get_account(mint).unwrap();
+    let state = StateWithExtensions::<MintState>::unpack(&account.data).unwrap();
+    state.get_extension_types().unwrap()
+}
+
+#[test]
+fn reissued_mint_carries_v1_extensions_plus_seizure_and_confidential() {
+    let (mut svm, payer) = setup();
+    let mint = Keypair::new();
+    send(
+        &mut svm,
+        &payer,
+        &[reissue_remittance_mint_ix(&payer.pubkey(), &mint.pubkey())],
+        &[&mint],
+    );
+
+    let account = svm.get_account(&mint.pubkey()).unwrap();
+    let expected =
+        ExtensionType::try_calculate_account_len::<MintState>(&reissue_extensions()).unwrap();
+    assert_eq!(account.data.len(), expected);
+
+    let state = StateWithExtensions::<MintState>::unpack(&account.data).unwrap();
+    let types = state.get_extension_types().unwrap();
+    for required in reissue_extensions() {
+        assert!(types.contains(&required), "missing {required:?}; have {types:?}");
+    }
+
+    let delegate = state.get_extension::<PermanentDelegate>().unwrap();
+    assert_eq!(
+        Option::<Pubkey>::from(delegate.delegate),
+        Some(payer.pubkey())
+    );
+
+    let ct = state.get_extension::<ConfidentialTransferMint>().unwrap();
+    assert!(!bool::from(ct.auto_approve_new_accounts));
+}
+
+#[test]
+fn v1_mint_cannot_gain_confidential_transfers_after_initialize() {
+    let (mut svm, payer) = setup();
+    let v1 = Keypair::new();
+    send(
+        &mut svm,
+        &payer,
+        &[create_remittance_mint_ix(&payer.pubkey(), &v1.pubkey())],
+        &[&v1],
+    );
+
+    let v1_types = mint_extensions(&svm, &v1.pubkey());
+    assert!(!v1_types.contains(&ExtensionType::PermanentDelegate));
+    assert!(!v1_types.contains(&ExtensionType::ConfidentialTransferMint));
+
+    let logs = send_expecting_failure(
+        &mut svm,
+        &payer,
+        &[ct_ix::initialize_mint(
+            &TOKEN_2022_PROGRAM_ID,
+            &v1.pubkey(),
+            Some(payer.pubkey()),
+            false,
+            None,
+        )
+        .unwrap()],
+        &[],
+    );
+    assert!(
+        logs.contains("already in use")
+            || logs.contains("initialized")
+            || logs.contains("InvalidAccountData")
+            || logs.contains("0x3"),
+        "expected init-after-seal to fail:\n{logs}"
+    );
 }
