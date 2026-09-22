@@ -21,6 +21,7 @@ use t22new::{
 };
 use zk::{
     encryption::{
+        auth_encryption::{AeCiphertext, AeKey},
         derivation::derive_confidential_keys,
         elgamal::{ElGamalCiphertext, ElGamalKeypair},
     },
@@ -182,7 +183,7 @@ fn stage_pubkey_proof(
     svm: &mut LiteSVM,
     payer: &Keypair,
     owner: &Keypair,
-) -> (ElGamalKeypair, [u8; AE_CIPHERTEXT_LEN], Pubkey) {
+) -> (ElGamalKeypair, AeKey, [u8; AE_CIPHERTEXT_LEN], Pubkey) {
     let (elgamal, aes) = derive_confidential_keys(owner, b"").unwrap();
     let proof = build_pubkey_validity_proof_data(&elgamal).unwrap();
     let ctx = stage_proof(
@@ -191,7 +192,8 @@ fn stage_pubkey_proof(
         ProofInstruction::VerifyPubkeyValidity,
         &proof,
     );
-    (elgamal, aes.encrypt(0).to_bytes(), ctx)
+    let zero_balance = aes.encrypt(0).to_bytes();
+    (elgamal, aes, zero_balance, ctx)
 }
 
 fn thaw_ix(token_account: &Pubkey, mint: &Pubkey, freeze_authority: &Pubkey) -> Instruction {
@@ -239,6 +241,11 @@ fn public_amount(svm: &LiteSVM, account: &Pubkey) -> u64 {
         .amount
 }
 
+fn available_balance(ct: &ConfidentialTransferAccount, elgamal: &ElGamalKeypair) -> u64 {
+    let ciphertext: ElGamalCiphertext = ct.available_balance.try_into().unwrap();
+    elgamal.secret().decrypt_u32(&ciphertext).unwrap()
+}
+
 fn pending_balance(ct: &ConfidentialTransferAccount, elgamal: &ElGamalKeypair) -> u64 {
     let lo: ElGamalCiphertext = ct.pending_balance_lo.try_into().unwrap();
     let hi: ElGamalCiphertext = ct.pending_balance_hi.try_into().unwrap();
@@ -278,6 +285,28 @@ fn configure_ix(
     }
 }
 
+fn apply_ix(
+    token_account: &Pubkey,
+    authority: &Pubkey,
+    expected_pending_balance_credit_counter: u64,
+    new_decryptable_available_balance: [u8; AE_CIPHERTEXT_LEN],
+) -> Instruction {
+    Instruction {
+        program_id: ID,
+        accounts: accounts::ApplyPendingBalance {
+            token_account: *token_account,
+            authority: *authority,
+            token_program: TOKEN_2022_PROGRAM_ID,
+        }
+        .to_account_metas(None),
+        data: instruction::ApplyPendingBalance {
+            expected_pending_balance_credit_counter,
+            new_decryptable_available_balance,
+        }
+        .data(),
+    }
+}
+
 fn approve_ix(token_account: &Pubkey, mint: &Pubkey, authority: &Pubkey) -> Instruction {
     Instruction {
         program_id: ID,
@@ -312,7 +341,7 @@ fn anyone_can_create_the_account_only_the_owner_can_configure() {
     svm.airdrop(&owner.pubkey(), 10_000_000_000).unwrap();
 
     let account = create_holder_account(&mut svm, &payer, &mint.pubkey(), &owner.pubkey());
-    let (_elgamal, zero_balance, proof_ctx) = stage_pubkey_proof(&mut svm, &payer, &owner);
+    let (_elgamal, _aes, zero_balance, proof_ctx) = stage_pubkey_proof(&mut svm, &payer, &owner);
 
     let logs = send_expecting_failure(
         &mut svm,
@@ -353,7 +382,7 @@ fn manual_approve_is_required_after_configure() {
     let mint = create_v2_mint(&mut svm, &payer);
     let owner = payer.insecure_clone();
     let account = create_holder_account(&mut svm, &payer, &mint.pubkey(), &owner.pubkey());
-    let (_elgamal, zero_balance, proof_ctx) = stage_pubkey_proof(&mut svm, &payer, &owner);
+    let (_elgamal, _aes, zero_balance, proof_ctx) = stage_pubkey_proof(&mut svm, &payer, &owner);
 
     send(
         &mut svm,
@@ -410,7 +439,7 @@ fn deposit_is_rejected_until_the_account_is_approved() {
     let mint = create_v2_mint(&mut svm, &payer);
     let owner = payer.insecure_clone();
     let account = create_holder_account(&mut svm, &payer, &mint.pubkey(), &owner.pubkey());
-    let (_elgamal, zero_balance, proof_ctx) = stage_pubkey_proof(&mut svm, &payer, &owner);
+    let (_elgamal, _aes, zero_balance, proof_ctx) = stage_pubkey_proof(&mut svm, &payer, &owner);
 
     send(
         &mut svm,
@@ -445,7 +474,7 @@ fn deposit_moves_public_tokens_into_pending_confidential() {
     let mint = create_v2_mint(&mut svm, &payer);
     let owner = payer.insecure_clone();
     let account = create_holder_account(&mut svm, &payer, &mint.pubkey(), &owner.pubkey());
-    let (elgamal, zero_balance, proof_ctx) = stage_pubkey_proof(&mut svm, &payer, &owner);
+    let (elgamal, _aes, zero_balance, proof_ctx) = stage_pubkey_proof(&mut svm, &payer, &owner);
 
     send(
         &mut svm,
@@ -479,4 +508,94 @@ fn deposit_moves_public_tokens_into_pending_confidential() {
     assert_eq!(public_amount(&svm, &account), 0);
     assert_eq!(pending_balance(&ct, &elgamal), 10_000);
     assert_eq!(u64::from(ct.pending_balance_credit_counter), 1);
+}
+
+fn deposited(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    amount: u64,
+) -> (Pubkey, Pubkey, ElGamalKeypair, AeKey) {
+    let mint = create_v2_mint(svm, payer);
+    let owner = payer.insecure_clone();
+    let account = create_holder_account(svm, payer, &mint.pubkey(), &owner.pubkey());
+    let (elgamal, aes, zero_balance, proof_ctx) = stage_pubkey_proof(svm, payer, &owner);
+
+    send(
+        svm,
+        payer,
+        &[configure_ix(
+            &account,
+            &mint.pubkey(),
+            &proof_ctx,
+            &owner.pubkey(),
+            zero_balance,
+        )],
+        &[],
+    );
+    send(
+        svm,
+        payer,
+        &[approve_ix(&account, &mint.pubkey(), &payer.pubkey())],
+        &[],
+    );
+    fund_public(svm, payer, &mint.pubkey(), &account, amount);
+    send(
+        svm,
+        payer,
+        &[deposit_ix(&account, &mint.pubkey(), &owner.pubkey(), amount)],
+        &[],
+    );
+    (mint.pubkey(), account, elgamal, aes)
+}
+
+#[test]
+fn apply_pending_does_not_verify_the_aes_ciphertext() {
+    let (mut svm, payer) = setup();
+    let (_mint, account, elgamal, aes) = deposited(&mut svm, &payer, 10_000);
+
+    send(
+        &mut svm,
+        &payer,
+        &[apply_ix(
+            &account,
+            &payer.pubkey(),
+            0,
+            aes.encrypt(0).to_bytes(),
+        )],
+        &[],
+    );
+
+    let ct = read_ct(&svm, &account);
+    assert_eq!(pending_balance(&ct, &elgamal), 0);
+    assert_eq!(available_balance(&ct, &elgamal), 10_000);
+
+    let decryptable: AeCiphertext = ct.decryptable_available_balance.try_into().unwrap();
+    assert_eq!(aes.decrypt(&decryptable).unwrap(), 0);
+    assert_eq!(u64::from(ct.expected_pending_balance_credit_counter), 0);
+    assert_eq!(u64::from(ct.actual_pending_balance_credit_counter), 1);
+}
+
+#[test]
+fn apply_pending_moves_inbox_to_available() {
+    let (mut svm, payer) = setup();
+    let (_mint, account, elgamal, aes) = deposited(&mut svm, &payer, 10_000);
+    let ct = read_ct(&svm, &account);
+    let counter: u64 = ct.pending_balance_credit_counter.into();
+    let new_available = available_balance(&ct, &elgamal) + pending_balance(&ct, &elgamal);
+
+    send(
+        &mut svm,
+        &payer,
+        &[apply_ix(
+            &account,
+            &payer.pubkey(),
+            counter,
+            aes.encrypt(new_available).to_bytes(),
+        )],
+        &[],
+    );
+
+    let ct = read_ct(&svm, &account);
+    assert_eq!(pending_balance(&ct, &elgamal), 0);
+    assert_eq!(available_balance(&ct, &elgamal), 10_000);
 }
