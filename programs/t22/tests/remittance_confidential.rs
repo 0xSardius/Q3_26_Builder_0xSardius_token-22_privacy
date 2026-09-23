@@ -11,10 +11,13 @@ use solana_message::Message;
 use solana_signer::Signer;
 use solana_transaction::Transaction;
 use t22::{accounts, instruction, AE_CIPHERTEXT_LEN, ID};
+use proofext::instruction::ProofLocation;
+use proofgen::{transfer_with_fee::transfer_with_fee_split_proof_data, withdraw::withdraw_proof_data};
 use t22new::{
     extension::{
-        confidential_transfer::ConfidentialTransferAccount, BaseStateWithExtensions, ExtensionType,
-        StateWithExtensions,
+        confidential_transfer::{instruction as ct_ix, ConfidentialTransferAccount},
+        confidential_transfer_fee::ConfidentialTransferFeeAmount,
+        BaseStateWithExtensions, ExtensionType, StateWithExtensions,
     },
     instruction::{initialize_account3, mint_to},
     state::Account as TokenAccountState,
@@ -23,12 +26,12 @@ use zk::{
     encryption::{
         auth_encryption::{AeCiphertext, AeKey},
         derivation::derive_confidential_keys,
-        elgamal::{ElGamalCiphertext, ElGamalKeypair},
+        elgamal::{ElGamalCiphertext, ElGamalKeypair, ElGamalPubkey},
     },
     zk_elgamal_proof_program::pubkey_validity::build_pubkey_validity_proof_data,
 };
 use zkif::{
-    instruction::{ContextStateInfo, ProofInstruction},
+    instruction::{close_context_state, ContextStateInfo, ProofInstruction},
     proof_data::ZkProofData,
     state::ProofContextState,
 };
@@ -78,7 +81,16 @@ fn send_expecting_failure(
 }
 
 fn create_v2_mint(svm: &mut LiteSVM, payer: &Keypair) -> Keypair {
+    create_v2_mint_with_fee_authority(svm, payer).0
+}
+
+fn create_v2_mint_with_fee_authority(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+) -> (Keypair, ElGamalKeypair) {
     let mint = Keypair::new();
+    let fee_authority = ElGamalKeypair::new_rand();
+    let fee_authority_pubkey: [u8; 32] = fee_authority.pubkey().into();
     send(
         svm,
         payer,
@@ -95,13 +107,13 @@ fn create_v2_mint(svm: &mut LiteSVM, payer: &Keypair) -> Keypair {
                 decimals: DECIMALS,
                 basis_points: BASIS_POINTS,
                 maximum_fee: MAXIMUM_FEE,
-                withdraw_withheld_authority_elgamal_pubkey: [0u8; 32],
+                withdraw_withheld_authority_elgamal_pubkey: fee_authority_pubkey,
             }
             .data(),
         }],
         &[&mint],
     );
-    mint
+    (mint, fee_authority)
 }
 
 fn create_holder_account(
@@ -598,4 +610,346 @@ fn apply_pending_moves_inbox_to_available() {
     let ct = read_ct(&svm, &account);
     assert_eq!(pending_balance(&ct, &elgamal), 0);
     assert_eq!(available_balance(&ct, &elgamal), 10_000);
+}
+
+struct Holder {
+    account: Pubkey,
+    elgamal: ElGamalKeypair,
+    aes: AeKey,
+}
+
+fn onboard(svm: &mut LiteSVM, payer: &Keypair, mint: &Pubkey, owner: &Keypair) -> Holder {
+    let account = create_holder_account(svm, payer, mint, &owner.pubkey());
+    let (elgamal, aes, zero_balance, proof_ctx) = stage_pubkey_proof(svm, payer, owner);
+    send(
+        svm,
+        payer,
+        &[configure_ix(&account, mint, &proof_ctx, &owner.pubkey(), zero_balance)],
+        &[owner],
+    );
+    send(
+        svm,
+        payer,
+        &[
+            approve_ix(&account, mint, &payer.pubkey()),
+            thaw_ix(&account, mint, &payer.pubkey()),
+        ],
+        &[],
+    );
+    Holder {
+        account,
+        elgamal,
+        aes,
+    }
+}
+
+fn apply(svm: &mut LiteSVM, payer: &Keypair, holder: &Holder, owner: &Keypair) {
+    let ct = read_ct(svm, &holder.account);
+    let counter: u64 = ct.pending_balance_credit_counter.into();
+    let new_available =
+        available_balance(&ct, &holder.elgamal) + pending_balance(&ct, &holder.elgamal);
+    send(
+        svm,
+        payer,
+        &[apply_ix(
+            &holder.account,
+            &owner.pubkey(),
+            counter,
+            holder.aes.encrypt(new_available).to_bytes(),
+        )],
+        &[owner],
+    );
+}
+
+fn close_contexts(svm: &mut LiteSVM, payer: &Keypair, contexts: &[Pubkey]) {
+    let ixs: Vec<Instruction> = contexts
+        .iter()
+        .map(|c| {
+            close_context_state(
+                ContextStateInfo {
+                    context_state_account: c,
+                    context_state_authority: &payer.pubkey(),
+                },
+                &payer.pubkey(),
+            )
+        })
+        .collect();
+    send(svm, payer, &ixs, &[]);
+}
+
+fn withheld_on(svm: &LiteSVM, account: &Pubkey, fee_authority: &ElGamalKeypair) -> u64 {
+    let acct = svm.get_account(account).unwrap();
+    let state = StateWithExtensions::<TokenAccountState>::unpack(&acct.data).unwrap();
+    let withheld: ElGamalCiphertext = state
+        .get_extension::<ConfidentialTransferFeeAmount>()
+        .unwrap()
+        .withheld_amount
+        .try_into()
+        .unwrap();
+    fee_authority.secret().decrypt_u32(&withheld).unwrap()
+}
+
+fn confidential_transfer_with_fee(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    mint: &Pubkey,
+    source: &Holder,
+    source_owner: &Keypair,
+    destination: &Holder,
+    fee_authority: &ElGamalKeypair,
+    amount: u64,
+) {
+    let ct = read_ct(svm, &source.account);
+    let current_available: ElGamalCiphertext = ct.available_balance.try_into().unwrap();
+    let current_decryptable: AeCiphertext = ct.decryptable_available_balance.try_into().unwrap();
+    let available = available_balance(&ct, &source.elgamal);
+    let destination_pubkey: ElGamalPubkey = read_ct(svm, &destination.account)
+        .elgamal_pubkey
+        .try_into()
+        .unwrap();
+
+    let proofs = transfer_with_fee_split_proof_data(
+        &current_available,
+        &current_decryptable,
+        amount,
+        &source.elgamal,
+        &source.aes,
+        &destination_pubkey,
+        None,
+        fee_authority.pubkey(),
+        BASIS_POINTS,
+        MAXIMUM_FEE,
+    )
+    .unwrap();
+
+    let eq_ctx = stage_proof(
+        svm,
+        payer,
+        ProofInstruction::VerifyCiphertextCommitmentEquality,
+        &proofs.equality_proof_data,
+    );
+    let val_ctx = stage_proof(
+        svm,
+        payer,
+        ProofInstruction::VerifyBatchedGroupedCiphertext3HandlesValidity,
+        &proofs
+            .transfer_amount_ciphertext_validity_proof_data_with_ciphertext
+            .proof_data,
+    );
+    let pct_ctx = stage_proof(
+        svm,
+        payer,
+        ProofInstruction::VerifyPercentageWithCap,
+        &proofs.percentage_with_cap_proof_data,
+    );
+    let fee_val_ctx = stage_proof(
+        svm,
+        payer,
+        ProofInstruction::VerifyBatchedGroupedCiphertext2HandlesValidity,
+        &proofs.fee_ciphertext_validity_proof_data,
+    );
+    let range_ctx = stage_proof(
+        svm,
+        payer,
+        ProofInstruction::VerifyBatchedRangeProofU256,
+        &proofs.range_proof_data,
+    );
+
+    let ixs = ct_ix::transfer_with_fee(
+        &TOKEN_2022_PROGRAM_ID,
+        &source.account,
+        mint,
+        &destination.account,
+        &source.aes.encrypt(available - amount).into(),
+        &proofs
+            .transfer_amount_ciphertext_validity_proof_data_with_ciphertext
+            .ciphertext_lo,
+        &proofs
+            .transfer_amount_ciphertext_validity_proof_data_with_ciphertext
+            .ciphertext_hi,
+        &source_owner.pubkey(),
+        &[],
+        ProofLocation::ContextStateAccount(&eq_ctx),
+        ProofLocation::ContextStateAccount(&val_ctx),
+        ProofLocation::ContextStateAccount(&pct_ctx),
+        ProofLocation::ContextStateAccount(&fee_val_ctx),
+        ProofLocation::ContextStateAccount(&range_ctx),
+    )
+    .unwrap();
+    send(svm, payer, &ixs, &[source_owner]);
+
+    close_contexts(svm, payer, &[eq_ctx, val_ctx, pct_ctx, fee_val_ctx, range_ctx]);
+}
+
+fn withdraw(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    mint: &Pubkey,
+    holder: &Holder,
+    owner: &Keypair,
+    amount: u64,
+) {
+    let ct = read_ct(svm, &holder.account);
+    let current: ElGamalCiphertext = ct.available_balance.try_into().unwrap();
+    let available = available_balance(&ct, &holder.elgamal);
+    let proofs = withdraw_proof_data(&current, available, amount, &holder.elgamal).unwrap();
+
+    let eq_ctx = stage_proof(
+        svm,
+        payer,
+        ProofInstruction::VerifyCiphertextCommitmentEquality,
+        &proofs.equality_proof_data,
+    );
+    let range_ctx = stage_proof(
+        svm,
+        payer,
+        ProofInstruction::VerifyBatchedRangeProofU64,
+        &proofs.range_proof_data,
+    );
+
+    let ixs = ct_ix::withdraw(
+        &TOKEN_2022_PROGRAM_ID,
+        &holder.account,
+        mint,
+        amount,
+        DECIMALS,
+        &holder.aes.encrypt(available - amount).into(),
+        &owner.pubkey(),
+        &[],
+        ProofLocation::ContextStateAccount(&eq_ctx),
+        ProofLocation::ContextStateAccount(&range_ctx),
+    )
+    .unwrap();
+    send(svm, payer, &ixs, &[owner]);
+
+    close_contexts(svm, payer, &[eq_ctx, range_ctx]);
+}
+
+#[test]
+fn confidential_remittance_withholds_an_encrypted_fee_then_withdraws() {
+    let (mut svm, payer) = setup();
+    let (mint, fee_authority) = create_v2_mint_with_fee_authority(&mut svm, &payer);
+    let mint = mint.pubkey();
+
+    let sender_owner = payer.insecure_clone();
+    let recipient_owner = Keypair::new();
+    svm.airdrop(&recipient_owner.pubkey(), 10_000_000_000).unwrap();
+
+    let sender = onboard(&mut svm, &payer, &mint, &sender_owner);
+    let recipient = onboard(&mut svm, &payer, &mint, &recipient_owner);
+
+    send(
+        &mut svm,
+        &payer,
+        &[
+            mint_to(&TOKEN_2022_PROGRAM_ID, &mint, &sender.account, &payer.pubkey(), &[], 100_000)
+                .unwrap(),
+            deposit_ix(&sender.account, &mint, &sender_owner.pubkey(), 100_000),
+        ],
+        &[],
+    );
+    apply(&mut svm, &payer, &sender, &sender_owner);
+
+    let amount = 10_000u64;
+    let fee = amount * u64::from(BASIS_POINTS) / 10_000;
+    confidential_transfer_with_fee(
+        &mut svm,
+        &payer,
+        &mint,
+        &sender,
+        &sender_owner,
+        &recipient,
+        &fee_authority,
+        amount,
+    );
+
+    let sender_ct = read_ct(&svm, &sender.account);
+    assert_eq!(available_balance(&sender_ct, &sender.elgamal), 100_000 - amount);
+    let recipient_ct = read_ct(&svm, &recipient.account);
+    assert_eq!(pending_balance(&recipient_ct, &recipient.elgamal), amount - fee);
+    assert_eq!(available_balance(&recipient_ct, &recipient.elgamal), 0);
+    assert_eq!(withheld_on(&svm, &recipient.account, &fee_authority), fee);
+    assert_eq!(public_amount(&svm, &sender.account), 0);
+    assert_eq!(public_amount(&svm, &recipient.account), 0);
+
+    let err = withdraw_proof_data(
+        &recipient_ct.available_balance.try_into().unwrap(),
+        available_balance(&recipient_ct, &recipient.elgamal),
+        1_000,
+        &recipient.elgamal,
+    );
+    assert!(err.is_err(), "withdraw must not be provable from pending");
+
+    apply(&mut svm, &payer, &recipient, &recipient_owner);
+    withdraw(&mut svm, &payer, &mint, &recipient, &recipient_owner, 1_000);
+
+    let recipient_ct = read_ct(&svm, &recipient.account);
+    assert_eq!(public_amount(&svm, &recipient.account), 1_000);
+    assert_eq!(
+        available_balance(&recipient_ct, &recipient.elgamal),
+        amount - fee - 1_000
+    );
+}
+
+#[test]
+fn a_withdraw_proof_that_lies_about_the_balance_is_rejected() {
+    let (mut svm, payer) = setup();
+    let mint = create_v2_mint(&mut svm, &payer).pubkey();
+    let owner = payer.insecure_clone();
+    let holder = onboard(&mut svm, &payer, &mint, &owner);
+
+    send(
+        &mut svm,
+        &payer,
+        &[
+            mint_to(&TOKEN_2022_PROGRAM_ID, &mint, &holder.account, &payer.pubkey(), &[], 5_000)
+                .unwrap(),
+            deposit_ix(&holder.account, &mint, &owner.pubkey(), 5_000),
+        ],
+        &[],
+    );
+
+    let ct = read_ct(&svm, &holder.account);
+    assert_eq!(available_balance(&ct, &holder.elgamal), 0);
+    assert_eq!(pending_balance(&ct, &holder.elgamal), 5_000);
+
+    let current: ElGamalCiphertext = ct.available_balance.try_into().unwrap();
+    assert!(withdraw_proof_data(&current, 5_000, 5_000, &holder.elgamal).is_err());
+
+    let fake_available = holder.elgamal.pubkey().encrypt(5_000u64);
+    let proofs = withdraw_proof_data(&fake_available, 5_000, 5_000, &holder.elgamal).unwrap();
+    let eq_ctx = stage_proof(
+        &mut svm,
+        &payer,
+        ProofInstruction::VerifyCiphertextCommitmentEquality,
+        &proofs.equality_proof_data,
+    );
+    let range_ctx = stage_proof(
+        &mut svm,
+        &payer,
+        ProofInstruction::VerifyBatchedRangeProofU64,
+        &proofs.range_proof_data,
+    );
+
+    let ixs = ct_ix::withdraw(
+        &TOKEN_2022_PROGRAM_ID,
+        &holder.account,
+        &mint,
+        5_000,
+        DECIMALS,
+        &holder.aes.encrypt(0).into(),
+        &owner.pubkey(),
+        &[],
+        ProofLocation::ContextStateAccount(&eq_ctx),
+        ProofLocation::ContextStateAccount(&range_ctx),
+    )
+    .unwrap();
+    let logs = send_expecting_failure(&mut svm, &payer, &ixs, &[]);
+    assert!(
+        logs.contains("Balance mismatch"),
+        "forged withdraw rejected for the wrong reason:\n{logs}"
+    );
+
+    assert_eq!(public_amount(&svm, &holder.account), 0);
+    assert_eq!(pending_balance(&read_ct(&svm, &holder.account), &holder.elgamal), 5_000);
 }
